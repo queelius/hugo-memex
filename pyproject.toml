@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hugo-memex"
+version = "0.1.0"
+description = "MCP server that makes any Hugo site's content queryable via SQLite with FTS5 full-text search"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Alexander Towell", email = "lex@metafunctor.com"},
+]
+readme = "README.md"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Text Processing :: Markup",
+]
+dependencies = [
+    "fastmcp<3",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov", "pytest-asyncio"]
+
+[project.urls]
+Homepage = "https://github.com/queelius/hugo-memex"
+Repository = "https://github.com/queelius/hugo-memex"
+Issues = "https://github.com/queelius/hugo-memex/issues"
+
+[project.scripts]
+hugo-memex = "hugo_memex.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+include = ["hugo_memex*"]

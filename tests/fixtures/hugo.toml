@@ -1,0 +1,12 @@
+baseURL = 'https://example.com/'
+title = 'Test Site'
+theme = 'ananke'
+
+[taxonomies]
+  tag = "tags"
+  category = "categories"
+  series = "series"
+
+[params]
+  author = "Test Author"
+  description = "A test Hugo site"
