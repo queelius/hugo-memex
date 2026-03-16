@@ -174,6 +174,132 @@ The path should be relative to the content/ directory.
 
         return target.read_text(encoding="utf-8-sig")
 
+    @mcp.tool(annotations={"readOnlyHint": True})
+    def get_pages(
+        section: Annotated[
+            str | None,
+            Field(description="Filter by section (e.g. 'post', 'projects')"),
+        ] = None,
+        tag: Annotated[
+            str | None,
+            Field(description="Filter by tag"),
+        ] = None,
+        search: Annotated[
+            str | None,
+            Field(description="FTS5 full-text search query"),
+        ] = None,
+        paths: Annotated[
+            list[str] | None,
+            Field(description="Specific page paths to retrieve"),
+        ] = None,
+        include_body: Annotated[
+            bool,
+            Field(description="Include full markdown body (default true)"),
+        ] = True,
+        include_drafts: Annotated[
+            bool,
+            Field(description="Include draft pages (default false)"),
+        ] = False,
+        limit: Annotated[
+            int,
+            Field(description="Max pages to return (default 20)"),
+        ] = 20,
+        ctx: Context | None = None,
+    ) -> list[dict]:
+        """Retrieve multiple pages with full content in a single call.
+
+Returns page metadata, front matter, taxonomy terms, and optionally
+the full markdown body. Use this instead of execute_sql + get_content
+when you need to read page content.
+
+Filters are combined with AND. At least one filter or paths must be provided.
+
+Examples:
+  get_pages(section="post", limit=10)           → 10 most recent posts with body
+  get_pages(tag="python", include_body=False)    → python-tagged pages, metadata only
+  get_pages(search="Bayesian inference")         → FTS5 search with full content
+  get_pages(paths=["post/my-post/index.md"])     → specific pages by path
+"""
+        database = _get_db(mcp, ctx)
+
+        conds = []
+        params = []
+
+        if not any([section, tag, search, paths]):
+            raise ToolError("Provide at least one filter: section, tag, search, or paths")
+
+        if paths:
+            placeholders = ",".join("?" for _ in paths)
+            conds.append(f"p.path IN ({placeholders})")
+            params.extend(paths)
+
+        if section:
+            conds.append("p.section = ?")
+            params.append(section)
+
+        if not include_drafts:
+            conds.append("p.draft = 0")
+
+        # Build the base query — join with FTS if searching
+        if search:
+            base = (
+                "SELECT p.path, p.title, p.section, p.date, p.slug, "
+                "p.kind, p.bundle_type, p.draft, p.description, "
+                "p.word_count, p.front_matter"
+                + (", p.body" if include_body else "")
+                + " FROM pages_fts f"
+                " JOIN pages p ON p.path = f.path"
+            )
+            conds.append("pages_fts MATCH ?")
+            params.append(search)
+        else:
+            base = (
+                "SELECT p.path, p.title, p.section, p.date, p.slug, "
+                "p.kind, p.bundle_type, p.draft, p.description, "
+                "p.word_count, p.front_matter"
+                + (", p.body" if include_body else "")
+                + " FROM pages p"
+            )
+
+        if tag:
+            conds.append(
+                "EXISTS(SELECT 1 FROM taxonomies t "
+                "WHERE t.page_path = p.path AND t.taxonomy = 'tags' AND t.term = ?)"
+            )
+            params.append(tag)
+
+        where = " AND ".join(conds) if conds else "1=1"
+        order = " ORDER BY rank" if search else " ORDER BY p.date DESC NULLS LAST"
+        params.append(limit)
+
+        try:
+            rows = database.execute_sql(
+                f"{base} WHERE {where}{order} LIMIT ?",
+                tuple(params),
+            )
+        except Exception as e:
+            raise ToolError(str(e))
+
+        # Enrich each row with its taxonomy terms
+        result = []
+        for row in rows:
+            page = dict(row)
+            # Parse front_matter from JSON string to dict
+            if isinstance(page.get("front_matter"), str):
+                page["front_matter"] = json.loads(page["front_matter"])
+            # Fetch taxonomy terms for this page
+            tax_rows = database.execute_sql(
+                "SELECT taxonomy, term FROM taxonomies WHERE page_path = ?",
+                (page["path"],),
+            )
+            taxonomies = {}
+            for tr in tax_rows:
+                taxonomies.setdefault(tr["taxonomy"], []).append(tr["term"])
+            page["taxonomies"] = taxonomies
+            result.append(page)
+
+        return result
+
     @mcp.tool()
     def rebuild_index(
         paths: Annotated[

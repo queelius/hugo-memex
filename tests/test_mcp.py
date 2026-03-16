@@ -164,6 +164,82 @@ class TestGetContent:
             fn(path="../content-evil/file.md")
 
 
+class TestGetPages:
+    @pytest.mark.asyncio
+    async def test_get_pages_by_section(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_pages")
+        result = fn(section="post")
+        assert len(result) >= 1
+        assert all(r["section"] == "post" for r in result)
+        # Should include body by default
+        assert "body" in result[0]
+        assert len(result[0]["body"]) > 0
+        # Should include taxonomies
+        assert "taxonomies" in result[0]
+        # front_matter should be a dict, not a JSON string
+        assert isinstance(result[0]["front_matter"], dict)
+
+    @pytest.mark.asyncio
+    async def test_get_pages_by_tag(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_pages")
+        result = fn(tag="python")
+        assert len(result) >= 1
+        for r in result:
+            assert "python" in r["taxonomies"].get("tags", [])
+
+    @pytest.mark.asyncio
+    async def test_get_pages_fts_search(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_pages")
+        result = fn(search="SQLite embedded database")
+        assert len(result) >= 1
+
+    @pytest.mark.asyncio
+    async def test_get_pages_by_paths(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_pages")
+        result = fn(paths=["post/test-post/index.md", "projects/test-project/index.md"])
+        assert len(result) == 2
+        paths = {r["path"] for r in result}
+        assert "post/test-post/index.md" in paths
+        assert "projects/test-project/index.md" in paths
+
+    @pytest.mark.asyncio
+    async def test_get_pages_no_body(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_pages")
+        result = fn(section="post", include_body=False)
+        assert len(result) >= 1
+        assert "body" not in result[0]
+
+    @pytest.mark.asyncio
+    async def test_get_pages_with_drafts(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_pages")
+        # Without drafts
+        no_drafts = fn(section="media")
+        # With drafts
+        with_drafts = fn(section="media", include_drafts=True)
+        assert len(with_drafts) >= len(no_drafts)
+
+    @pytest.mark.asyncio
+    async def test_get_pages_limit(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_pages")
+        result = fn(section="post", limit=1)
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_get_pages_requires_filter(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_pages")
+        with pytest.raises(Exception, match="filter"):
+            fn()
+
+    @pytest.mark.asyncio
+    async def test_get_pages_combined_filters(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_pages")
+        result = fn(section="post", tag="python")
+        assert len(result) >= 1
+        for r in result:
+            assert r["section"] == "post"
+            assert "python" in r["taxonomies"].get("tags", [])
+
+
 class TestRebuildIndex:
     @pytest.mark.asyncio
     async def test_rebuild_incremental(self, mcp_server):

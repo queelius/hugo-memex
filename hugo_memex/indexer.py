@@ -56,7 +56,7 @@ def discover_content(content_dir: Path) -> list[Path]:
     """Walk content/ and collect all .md files."""
     if not content_dir.exists():
         return []
-    return sorted(content_dir.rglob("*.md"))
+    return sorted(p for p in content_dir.rglob("*.md") if p.is_file())
 
 
 def classify_page(rel_path: str, filename: str) -> tuple[str, str, str | None]:
