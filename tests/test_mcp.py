@@ -101,6 +101,34 @@ class TestExecuteSQL:
             fn(sql="DELETE FROM pages")
 
     @pytest.mark.asyncio
+    async def test_pragma_bypass_blocked(self, mcp_server):
+        """PRAGMA query_only=OFF must not bypass the authorizer."""
+        fn = await _get_tool_fn(mcp_server, "execute_sql")
+        with pytest.raises(Exception):
+            fn(sql="PRAGMA query_only=OFF")
+        # Writes should still be blocked after the attempt
+        with pytest.raises(Exception):
+            fn(sql="DELETE FROM pages")
+
+    @pytest.mark.asyncio
+    async def test_pragma_writable_schema_blocked(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "execute_sql")
+        with pytest.raises(Exception):
+            fn(sql="PRAGMA writable_schema=ON")
+
+    @pytest.mark.asyncio
+    async def test_drop_table_blocked(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "execute_sql")
+        with pytest.raises(Exception):
+            fn(sql="DROP TABLE pages")
+
+    @pytest.mark.asyncio
+    async def test_attach_database_blocked(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "execute_sql")
+        with pytest.raises(Exception):
+            fn(sql="ATTACH DATABASE ':memory:' AS evil")
+
+    @pytest.mark.asyncio
     async def test_invalid_sql(self, mcp_server):
         fn = await _get_tool_fn(mcp_server, "execute_sql")
         with pytest.raises(Exception):
@@ -126,6 +154,14 @@ class TestGetContent:
         fn = await _get_tool_fn(mcp_server, "get_content")
         with pytest.raises(Exception, match="within content"):
             fn(path="../../etc/passwd")
+
+    @pytest.mark.asyncio
+    async def test_path_prefix_collision_blocked(self, mcp_server):
+        """Directory names that are prefixes of content/ must be blocked."""
+        fn = await _get_tool_fn(mcp_server, "get_content")
+        # ../content-evil/file.md would pass a naive startswith check
+        with pytest.raises(Exception):
+            fn(path="../content-evil/file.md")
 
 
 class TestRebuildIndex:
@@ -155,6 +191,12 @@ class TestRebuildIndex:
         sql_fn = await _get_tool_fn(mcp_server, "execute_sql")
         with pytest.raises(Exception):
             sql_fn(sql="DELETE FROM pages")
+
+    @pytest.mark.asyncio
+    async def test_rebuild_path_traversal_blocked(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "rebuild_index")
+        with pytest.raises(Exception, match="within content"):
+            fn(paths=["../../etc/passwd"])
 
 
 class TestResources:

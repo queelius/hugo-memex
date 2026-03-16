@@ -31,9 +31,7 @@ def _normalize_date(value: Any) -> str | None:
     """Normalize various date formats to ISO 8601 string."""
     if value is None:
         return None
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, date):
+    if isinstance(value, (datetime, date)):
         return value.isoformat()
     s = str(value)
     return s if s else None
@@ -45,9 +43,7 @@ def _make_json_safe(obj: Any) -> Any:
     YAML parses dates as datetime.date/datetime objects, which json.dumps
     can't handle. This converts them to ISO 8601 strings.
     """
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    if isinstance(obj, date):
+    if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     if isinstance(obj, dict):
         return {k: _make_json_safe(v) for k, v in obj.items()}
@@ -200,15 +196,12 @@ def index_content(
 
             # Build page record
             page = extract_page_record(rel_path, front_matter, body, file_hash)
-            db.save_page(page)
 
-            # Extract and save taxonomies
+            # Extract taxonomies
             taxonomies = extract_taxonomies(front_matter, taxonomy_defs)
-            if taxonomies:
-                db.save_taxonomies(rel_path, taxonomies)
 
-            # Update sync state
-            db.save_sync_state(rel_path, file_hash, file_mtime, _now_iso())
+            # Atomically save page + taxonomies + sync state
+            db.index_page(page, taxonomies, file_mtime, _now_iso())
             stats["indexed"] += 1
 
         except Exception as e:

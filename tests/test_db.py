@@ -173,6 +173,27 @@ class TestSyncState:
         assert "post/test-post/index.md" in paths
 
 
+class TestIndexPage:
+    def test_atomic_index_page(self, db, sample_page, sample_taxonomies):
+        """index_page saves page + taxonomies + sync state atomically."""
+        db.index_page(sample_page, sample_taxonomies, 1234567890.0, "2024-01-01T00:00:00Z")
+        pages = db.execute_sql("SELECT * FROM pages")
+        assert len(pages) == 1
+        taxs = db.execute_sql("SELECT * FROM taxonomies")
+        assert len(taxs) == 4
+        sync = db.get_sync_state("post/test-post/index.md")
+        assert sync is not None
+        assert sync["content_hash"] == "abc123"
+
+    def test_atomic_index_page_no_taxonomies(self, db, sample_page):
+        """index_page works with empty taxonomies."""
+        db.index_page(sample_page, {}, 1234567890.0, "2024-01-01T00:00:00Z")
+        pages = db.execute_sql("SELECT * FROM pages")
+        assert len(pages) == 1
+        taxs = db.execute_sql("SELECT * FROM taxonomies")
+        assert len(taxs) == 0
+
+
 class TestSchema:
     def test_get_schema_includes_ddl(self, db):
         schema = db.get_schema()

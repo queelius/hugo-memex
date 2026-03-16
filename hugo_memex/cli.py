@@ -84,14 +84,14 @@ def cmd_index(args):
 
 
 def cmd_stats(args):
-    config, db = _load(args.config)
+    _, db = _load(args.config)
     stats = db.get_statistics()
     print(json.dumps(stats, indent=2))
     db.close()
 
 
 def cmd_search(args):
-    config, db = _load(args.config)
+    _, db = _load(args.config)
     rows = db.execute_sql(
         "SELECT p.path, p.title, p.section, p.date, "
         "snippet(pages_fts, 3, '>>>', '<<<', '...', 32) as snippet "
@@ -113,7 +113,7 @@ def cmd_search(args):
 
 
 def cmd_sql(args):
-    config, db = _load(args.config)
+    _, db = _load(args.config)
     db.conn.execute("PRAGMA query_only=ON")
     try:
         rows = db.execute_sql(args.query)

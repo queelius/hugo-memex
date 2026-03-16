@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCHEMA_VERSION = 1
 
@@ -65,6 +65,35 @@ def _dict_factory(cursor, row):
     return {col[0]: row[i] for i, col in enumerate(cursor.description)}
 
 
+# Actions the authorizer allows for read-only connections.
+# This cannot be bypassed via SQL (unlike PRAGMA query_only).
+_READONLY_ALLOWED = {
+    sqlite3.SQLITE_SELECT,         # SELECT statements
+    sqlite3.SQLITE_READ,           # Column access
+    sqlite3.SQLITE_FUNCTION,       # json_extract, rank, etc.
+}
+
+# PRAGMAs that must never be allowed (they re-enable writes)
+_DENIED_PRAGMAS = {"query_only", "writable_schema"}
+
+
+def _readonly_authorizer(action_code, arg1, *_args):
+    """SQLite authorizer that denies all write operations.
+
+    Allows read-only PRAGMAs (needed by FTS5 internally) but blocks
+    PRAGMAs that could re-enable writes.
+    """
+    if action_code in _READONLY_ALLOWED:
+        return sqlite3.SQLITE_OK
+    if action_code == sqlite3.SQLITE_PRAGMA:
+        # Allow read-only PRAGMAs (e.g. data_version used by FTS5)
+        # but block PRAGMAs that could re-enable writes
+        if arg1 and arg1.lower() in _DENIED_PRAGMAS:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
 class Database:
     """SQLite database for Hugo content index."""
 
@@ -79,7 +108,7 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
         if readonly:
-            self.conn.execute("PRAGMA query_only=ON")
+            self.conn.set_authorizer(_readonly_authorizer)
 
     def _ensure_schema(self):
         tables = {
@@ -91,14 +120,7 @@ class Database:
         has_pages = "pages" in tables
         has_version = "schema_version" in tables
 
-        if not has_pages:
-            self.conn.executescript(SCHEMA_SQL)
-            self.conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?)",
-                (SCHEMA_VERSION,),
-            )
-            self.conn.commit()
-        elif not has_version:
+        if not has_pages or not has_version:
             self.conn.executescript(SCHEMA_SQL)
             self.conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)",
@@ -215,23 +237,21 @@ class Database:
 
     def get_statistics(self) -> dict[str, Any]:
         """Return aggregate stats for the hugo://stats resource."""
-        total = self.execute_sql(
-            "SELECT COUNT(*) as n FROM pages"
-        )[0]["n"]
+        agg = self.execute_sql(
+            "SELECT COUNT(*) as total, "
+            "COALESCE(SUM(word_count), 0) as word_count, "
+            "SUM(CASE WHEN draft = 1 THEN 1 ELSE 0 END) as draft, "
+            "SUM(CASE WHEN draft = 0 THEN 1 ELSE 0 END) as published, "
+            "MIN(CASE WHEN date IS NOT NULL THEN date END) as earliest, "
+            "MAX(CASE WHEN date IS NOT NULL THEN date END) as latest "
+            "FROM pages"
+        )[0]
         by_section = {
             r["section"]: r["n"]
             for r in self.execute_sql(
                 "SELECT section, COUNT(*) as n FROM pages "
                 "GROUP BY section ORDER BY n DESC"
             )
-        }
-        by_draft = {
-            "draft": self.execute_sql(
-                "SELECT COUNT(*) as n FROM pages WHERE draft = 1"
-            )[0]["n"],
-            "published": self.execute_sql(
-                "SELECT COUNT(*) as n FROM pages WHERE draft = 0"
-            )[0]["n"],
         }
         taxonomy_counts = {}
         for r in self.execute_sql(
@@ -242,22 +262,18 @@ class Database:
                 "distinct_terms": r["terms"],
                 "total_usages": r["usages"],
             }
-        date_range = self.execute_sql(
-            "SELECT MIN(date) as earliest, MAX(date) as latest "
-            "FROM pages WHERE date IS NOT NULL"
-        )[0]
-        word_count = self.execute_sql(
-            "SELECT SUM(word_count) as total FROM pages"
-        )[0]["total"] or 0
         return {
-            "total_pages": total,
-            "total_word_count": word_count,
+            "total_pages": agg["total"],
+            "total_word_count": agg["word_count"],
             "pages_by_section": by_section,
-            "draft_status": by_draft,
+            "draft_status": {
+                "draft": agg["draft"] or 0,
+                "published": agg["published"] or 0,
+            },
             "taxonomies": taxonomy_counts,
             "date_range": {
-                "earliest": date_range["earliest"],
-                "latest": date_range["latest"],
+                "earliest": agg["earliest"],
+                "latest": agg["latest"],
             },
         }
 
@@ -265,53 +281,82 @@ class Database:
 
     def save_page(self, page: dict[str, Any]) -> None:
         """Insert or replace a page record and update FTS5."""
-        try:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO pages "
-                "(path, slug, title, section, kind, bundle_type, "
-                "date, draft, description, word_count, body, "
-                "front_matter, content_hash, indexed_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    page["path"], page.get("slug"), page["title"],
-                    page["section"], page["kind"], page.get("bundle_type"),
-                    page.get("date"), int(page.get("draft", False)),
-                    page.get("description"), page.get("word_count"),
-                    page.get("body"),
-                    json.dumps(page.get("front_matter", {})),
-                    page["content_hash"], page["indexed_at"],
-                ),
-            )
-            # Update FTS5 (delete old, insert new)
-            self.conn.execute(
-                "DELETE FROM pages_fts WHERE path = ?", (page["path"],)
-            )
-            self.conn.execute(
-                "INSERT INTO pages_fts (path, title, description, body) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    page["path"], page["title"],
-                    page.get("description", ""), page.get("body", ""),
-                ),
-            )
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
+        self._write_page(page)
+        self.conn.commit()
+
+    def _write_page(self, page: dict[str, Any]) -> None:
+        """Write page + FTS without committing (for use in transactions)."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pages "
+            "(path, slug, title, section, kind, bundle_type, "
+            "date, draft, description, word_count, body, "
+            "front_matter, content_hash, indexed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                page["path"], page.get("slug"), page["title"],
+                page["section"], page["kind"], page.get("bundle_type"),
+                page.get("date"), int(page.get("draft", False)),
+                page.get("description"), page.get("word_count"),
+                page.get("body"),
+                json.dumps(page.get("front_matter", {})),
+                page["content_hash"], page["indexed_at"],
+            ),
+        )
+        self.conn.execute(
+            "DELETE FROM pages_fts WHERE path = ?", (page["path"],)
+        )
+        self.conn.execute(
+            "INSERT INTO pages_fts (path, title, description, body) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                page["path"], page["title"],
+                page.get("description", ""), page.get("body", ""),
+            ),
+        )
 
     def save_taxonomies(self, page_path: str, taxonomies: dict[str, list[str]]) -> None:
         """Save taxonomy terms for a page. Replaces existing terms."""
+        self._write_taxonomies(page_path, taxonomies)
+        self.conn.commit()
+
+    def _write_taxonomies(self, page_path: str, taxonomies: dict[str, list[str]]) -> None:
+        """Write taxonomies without committing (for use in transactions)."""
+        self.conn.execute(
+            "DELETE FROM taxonomies WHERE page_path = ?", (page_path,)
+        )
+        for taxonomy, terms in taxonomies.items():
+            for term in terms:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO taxonomies "
+                    "(page_path, taxonomy, term) VALUES (?, ?, ?)",
+                    (page_path, taxonomy, term),
+                )
+
+    def _write_sync_state(
+        self, file_path: str, content_hash: str,
+        file_mtime: float, last_synced: str,
+    ) -> None:
+        """Write sync state without committing (for use in transactions)."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sync_state "
+            "(file_path, content_hash, file_mtime, last_synced) "
+            "VALUES (?, ?, ?, ?)",
+            (file_path, content_hash, file_mtime, last_synced),
+        )
+
+    def index_page(
+        self, page: dict[str, Any],
+        taxonomies: dict[str, list[str]],
+        file_mtime: float, last_synced: str,
+    ) -> None:
+        """Atomically save page, taxonomies, and sync state in one transaction."""
         try:
-            self.conn.execute(
-                "DELETE FROM taxonomies WHERE page_path = ?", (page_path,)
+            self._write_page(page)
+            if taxonomies:
+                self._write_taxonomies(page["path"], taxonomies)
+            self._write_sync_state(
+                page["path"], page["content_hash"], file_mtime, last_synced,
             )
-            for taxonomy, terms in taxonomies.items():
-                for term in terms:
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO taxonomies "
-                        "(page_path, taxonomy, term) VALUES (?, ?, ?)",
-                        (page_path, taxonomy, term),
-                    )
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -368,4 +413,4 @@ class Database:
 
 
 # Migration registry (version_from → migration_fn)
-_MIGRATIONS: dict[int, callable] = {}
+_MIGRATIONS: dict[int, Callable] = {}

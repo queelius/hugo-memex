@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 
@@ -27,6 +26,9 @@ async def lifespan(server):
             "configure hugo_root in config.yaml"
         )
     db = Database(config["database_path"])
+    # Store on server object so resources (which can't receive ctx) can access them
+    server._live_db = db
+    server._live_config = config
     try:
         yield {"db": db, "config": config}
     finally:
@@ -41,7 +43,8 @@ def create_server(db=None, config=None):
     mcp = FastMCP("hugo-memex", lifespan=lifespan if db is None else None)
     if db is not None:
         if not db.readonly:
-            db.conn.execute("PRAGMA query_only=ON")
+            from hugo_memex.db import _readonly_authorizer
+            db.conn.set_authorizer(_readonly_authorizer)
             db.readonly = True
         mcp._test_db = db
         mcp._test_config = config or {}
@@ -50,20 +53,24 @@ def create_server(db=None, config=None):
     return mcp
 
 
-def _get_db(mcp, ctx):
-    """Get database from lifespan context or test injection."""
-    try:
-        return ctx.request_context.lifespan_context["db"]
-    except (AttributeError, TypeError, KeyError):
-        return mcp._test_db
+def _get_db(mcp, ctx=None):
+    """Get database from lifespan context, server object, or test injection."""
+    if ctx is not None:
+        try:
+            return ctx.request_context.lifespan_context["db"]
+        except (AttributeError, TypeError, KeyError):
+            pass
+    return getattr(mcp, "_live_db", None) or getattr(mcp, "_test_db", None)
 
 
-def _get_config(mcp, ctx):
-    """Get config from lifespan context or test injection."""
-    try:
-        return ctx.request_context.lifespan_context["config"]
-    except (AttributeError, TypeError, KeyError):
-        return mcp._test_config
+def _get_config(mcp, ctx=None):
+    """Get config from lifespan context, server object, or test injection."""
+    if ctx is not None:
+        try:
+            return ctx.request_context.lifespan_context["config"]
+        except (AttributeError, TypeError, KeyError):
+            pass
+    return getattr(mcp, "_live_config", None) or getattr(mcp, "_test_config", {})
 
 
 def _register_tools(mcp: FastMCP):
@@ -76,7 +83,7 @@ def _register_tools(mcp: FastMCP):
             list | None,
             Field(description="Query parameters for ? placeholders"),
         ] = None,
-        ctx=None,
+        ctx: Context | None = None,
     ) -> list[dict]:
         """Run a read-only SQL query against the Hugo content index.
 Read hugo://schema for full DDL and query patterns.
@@ -142,7 +149,7 @@ Cross-reference (pages sharing a tag):
             str,
             Field(description="Content path relative to content/ (e.g. 'post/my-post/index.md')"),
         ],
-        ctx=None,
+        ctx: Context | None = None,
     ) -> str:
         """Return raw markdown content from the Hugo site filesystem.
 
@@ -157,8 +164,8 @@ The path should be relative to the content/ directory.
         content_root = Path(hugo_root) / "content"
         target = (content_root / path).resolve()
 
-        # Path traversal protection
-        if not str(target).startswith(str(content_root.resolve())):
+        # Path traversal protection (is_relative_to is immune to prefix collisions)
+        if not target.is_relative_to(content_root.resolve()):
             raise ToolError("Path must be within content/ directory")
         if not target.exists():
             raise ToolError(f"File not found: {path}")
@@ -177,7 +184,7 @@ The path should be relative to the content/ directory.
             bool,
             Field(description="Force full re-index, ignoring sync state"),
         ] = False,
-        ctx=None,
+        ctx: Context | None = None,
     ) -> dict:
         """Re-index Hugo content into the SQLite database.
 
@@ -190,18 +197,31 @@ Pass specific paths to re-index only those files.
         if not hugo_root:
             raise ToolError("hugo_root not configured")
 
+        # Validate paths stay within content/
+        if paths:
+            content_root = Path(hugo_root) / "content"
+            for p in paths:
+                resolved = (content_root / p).resolve()
+                if not resolved.is_relative_to(content_root.resolve()):
+                    raise ToolError(f"Path must be within content/: {p}")
+
         database = _get_db(mcp, ctx)
-        # Temporarily disable query_only for indexing
-        was_readonly = database.readonly
-        if was_readonly:
-            database.conn.execute("PRAGMA query_only=OFF")
-            database.readonly = False
-        try:
-            return index_content(hugo_root, database, paths=paths, force=force)
-        finally:
-            if was_readonly:
-                database.conn.execute("PRAGMA query_only=ON")
-                database.readonly = True
+        # Use a separate read-write connection for indexing to avoid
+        # disabling the authorizer on the shared read-only connection.
+        # For :memory: DBs (tests), we must reuse the same connection.
+        if database.db_path == ":memory:":
+            database.conn.set_authorizer(None)
+            try:
+                return index_content(hugo_root, database, paths=paths, force=force)
+            finally:
+                from hugo_memex.db import _readonly_authorizer
+                database.conn.set_authorizer(_readonly_authorizer)
+        else:
+            write_db = Database(database.db_path)
+            try:
+                return index_content(hugo_root, write_db, paths=paths, force=force)
+            finally:
+                write_db.close()
 
 
 def _register_resources(mcp: FastMCP):
@@ -214,13 +234,13 @@ def _register_resources(mcp: FastMCP):
     from fastmcp.resources import FunctionResource
 
     def _schema_fn() -> str:
-        db = getattr(mcp, "_test_db", None)
+        db = _get_db(mcp)
         if db is None:
             return "Database not available"
         return db.get_schema()
 
     def _site_fn() -> str:
-        config = getattr(mcp, "_test_config", {})
+        config = _get_config(mcp)
         hugo_root = config.get("hugo_root")
         if not hugo_root:
             return json.dumps({"error": "hugo_root not configured"})
@@ -231,7 +251,7 @@ def _register_resources(mcp: FastMCP):
             return json.dumps({"error": str(e)})
 
     def _stats_fn() -> str:
-        db = getattr(mcp, "_test_db", None)
+        db = _get_db(mcp)
         if db is None:
             return json.dumps({"error": "Database not available"})
         return json.dumps(db.get_statistics(), indent=2)
