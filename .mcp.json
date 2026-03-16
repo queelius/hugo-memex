@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "hugo-memex": {
+      "command": "python",
+      "args": ["-m", "hugo_memex", "mcp"],
+      "env": {
+        "HUGO_MEMEX_CONFIG": "/home/spinoza/.config/hugo-memex/config.yaml"
+      }
+    }
+  }
+}
