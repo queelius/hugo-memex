@@ -350,6 +350,127 @@ Pass specific paths to re-index only those files.
                 write_db.close()
 
 
+    # ── Writing tools ──────────────────────────────────────────
+
+    @mcp.tool()
+    def create_page(
+        section: Annotated[str, Field(description="Content section (e.g. 'post', 'projects')")],
+        slug: Annotated[str, Field(description="URL slug (becomes directory name)")],
+        title: Annotated[str, Field(description="Page title")],
+        body: Annotated[str, Field(description="Markdown body content")],
+        tags: Annotated[list[str] | None, Field(description="Tags list")] = None,
+        categories: Annotated[list[str] | None, Field(description="Categories list")] = None,
+        description: Annotated[str | None, Field(description="Short description")] = None,
+        extra_front_matter: Annotated[dict | None, Field(description="Additional front matter fields to merge")] = None,
+        draft: Annotated[bool, Field(description="Create as draft (default true)")] = True,
+        bundle: Annotated[bool, Field(description="Create as leaf bundle with index.md (default true)")] = True,
+        ctx: Context | None = None,
+    ) -> dict:
+        """Create a new Hugo content page with proper directory structure and front matter.
+
+Creates a leaf bundle (section/slug/index.md) by default. Front matter
+follows the conventions of existing pages in the section.
+
+After creating, call rebuild_index(paths=[result.path]) to add it to the index.
+"""
+        config = _get_config(mcp, ctx)
+        hugo_root = config.get("hugo_root")
+        if not hugo_root:
+            raise ToolError("hugo_root not configured")
+
+        from hugo_memex.writer import create_page as _create
+
+        fm = {"title": title, "draft": draft}
+        if description:
+            fm["description"] = description
+        if tags:
+            fm["tags"] = tags
+        if categories:
+            fm["categories"] = categories
+        if extra_front_matter:
+            fm.update(extra_front_matter)
+
+        try:
+            return _create(hugo_root, section, slug, fm, body, bundle=bundle)
+        except (FileExistsError, FileNotFoundError, ValueError) as e:
+            raise ToolError(str(e))
+
+    @mcp.tool()
+    def update_page(
+        path: Annotated[str, Field(description="Content path relative to content/")],
+        front_matter: Annotated[dict | None, Field(description="Front matter fields to merge (not replace)")] = None,
+        body: Annotated[str | None, Field(description="New markdown body (replaces entire body)")] = None,
+        ctx: Context | None = None,
+    ) -> dict:
+        """Update an existing Hugo content page's front matter and/or body.
+
+Front matter is merged (only specified keys change). Body is replaced entirely
+if provided. Call rebuild_index(paths=[path]) after to update the index.
+"""
+        config = _get_config(mcp, ctx)
+        hugo_root = config.get("hugo_root")
+        if not hugo_root:
+            raise ToolError("hugo_root not configured")
+
+        from hugo_memex.writer import update_page as _update
+
+        try:
+            return _update(hugo_root, path, front_matter=front_matter, body=body)
+        except (FileNotFoundError, ValueError) as e:
+            raise ToolError(str(e))
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    def suggest_tags(
+        text: Annotated[str, Field(description="Content text to analyze for tag suggestions")],
+        limit: Annotated[int, Field(description="Max suggestions (default 10)")] = 10,
+        ctx: Context | None = None,
+    ) -> list[dict]:
+        """Suggest existing tags based on content text using FTS5 similarity.
+
+Finds pages similar to the given text and returns their most common tags,
+with canonical casing (resolves Python/python, AI/ai duplicates).
+Use this when writing new content to pick consistent, relevant tags.
+"""
+        database = _get_db(mcp, ctx)
+        from hugo_memex.writer import suggest_tags as _suggest
+        return _suggest(database, text, limit=limit)
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    def get_front_matter_template(
+        section: Annotated[str, Field(description="Section to derive template from (e.g. 'post', 'projects')")],
+        ctx: Context | None = None,
+    ) -> dict:
+        """Get the front matter template for a section, derived from existing pages.
+
+Returns each common key with its type, frequency, example value, and default.
+No hardcoded templates — derived from the actual data in the index.
+Use this before create_page to know what front matter fields the section expects.
+"""
+        database = _get_db(mcp, ctx)
+        from hugo_memex.writer import get_front_matter_template as _template
+        return _template(database, section)
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    def validate_page(
+        path: Annotated[str, Field(description="Content path relative to content/")],
+        ctx: Context | None = None,
+    ) -> dict:
+        """Validate a page for completeness and consistency.
+
+Checks: required fields (title, date, description, tags), tag case consistency
+(flags duplicates like Python/python), cross-reference validity (linked_project,
+related_posts), and GPG body hash match.
+"""
+        config = _get_config(mcp, ctx)
+        hugo_root = config.get("hugo_root")
+        if not hugo_root:
+            raise ToolError("hugo_root not configured")
+
+        database = _get_db(mcp, ctx)
+        from hugo_memex.writer import validate_page as _validate
+        return _validate(database, hugo_root, path)
+
+
 def _register_resources(mcp: FastMCP):
     """Register all MCP resources.
 
