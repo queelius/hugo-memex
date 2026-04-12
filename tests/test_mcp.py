@@ -28,6 +28,19 @@ def mcp_server(indexed_db, hugo_root):
     return create_server(db=indexed_db, config=config)
 
 
+@pytest.fixture
+def writable_mcp_server(tmp_path, fixtures_dir):
+    """MCP server on a writable copy of the fixture site."""
+    import shutil
+    site = tmp_path / "site"
+    shutil.copytree(fixtures_dir, site)
+    db = Database(":memory:")
+    stats = index_content(str(site), db)
+    assert stats["errors"] == []
+    config = {"hugo_root": str(site)}
+    return create_server(db=db, config=config), site
+
+
 async def _get_tool_fn(server, name):
     """Get a registered tool's underlying function."""
     tool = await server.get_tool(name)
@@ -326,3 +339,33 @@ class TestServerSetup:
         assert "hugo://schema" in resource_uris
         assert "hugo://site" in resource_uris
         assert "hugo://stats" in resource_uris
+
+
+class TestCreatePageWrapper:
+    @pytest.mark.asyncio
+    async def test_extra_front_matter_does_not_clobber_title(self, writable_mcp_server):
+        """Explicit title must win over extra_front_matter.title."""
+        server, site = writable_mcp_server
+        fn = await _get_tool_fn(server, "create_page")
+        result = fn(
+            section="post", slug="title-check",
+            title="Real Title", body="body",
+            extra_front_matter={"title": "HIJACKED", "other": 42},
+        )
+        assert result["status"] == "created"
+        # Verify the actual file has the explicit title, not the hijack
+        from hugo_memex.parser import parse_content
+        raw = (site / "content" / result["path"]).read_text()
+        fm, _ = parse_content(raw)
+        assert fm["title"] == "Real Title"
+        assert fm["other"] == 42
+
+    @pytest.mark.asyncio
+    async def test_traversal_via_slug_rejected(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        fn = await _get_tool_fn(server, "create_page")
+        with pytest.raises(Exception, match="Invalid slug"):
+            fn(
+                section="post", slug="../../../tmp/evil",
+                title="x", body="body",
+            )

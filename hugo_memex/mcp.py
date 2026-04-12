@@ -53,6 +53,28 @@ def create_server(db=None, config=None):
     return mcp
 
 
+def _get_tag_taxonomy(config: dict) -> str:
+    """Determine which taxonomy name a Hugo site uses for tags.
+
+    Hugo's convention is `tag = "tags"` (singular key, plural value).
+    We look up the plural form whose singular is "tag"; if the site doesn't
+    define one (e.g. taxonomies disabled), fall back to the default "tags".
+    """
+    hugo_root = config.get("hugo_root") if config else None
+    if not hugo_root:
+        return "tags"
+    try:
+        hugo_config = load_hugo_config(hugo_root)
+        taxonomies = hugo_config.get("taxonomies", {}) or {}
+        # taxonomies maps singular → plural. Find the plural whose singular is "tag".
+        for singular, plural in taxonomies.items():
+            if singular == "tag":
+                return plural
+    except Exception:
+        pass
+    return "tags"
+
+
 def _get_db(mcp, ctx=None):
     """Get database from lifespan context, server object, or test injection."""
     if ctx is not None:
@@ -220,13 +242,12 @@ Examples:
   get_pages(search="Bayesian inference")         → FTS5 search with full content
   get_pages(paths=["post/my-post/index.md"])     → specific pages by path
 """
-        database = _get_db(mcp, ctx)
-
-        conds = []
-        params = []
-
         if not any([section, tag, search, paths]):
             raise ToolError("Provide at least one filter: section, tag, search, or paths")
+
+        database = _get_db(mcp, ctx)
+        conds = []
+        params = []
 
         if paths:
             placeholders = ",".join("?" for _ in paths)
@@ -240,33 +261,29 @@ Examples:
         if not include_drafts:
             conds.append("p.draft = 0")
 
-        # Build the base query — join with FTS if searching
+        # Shared column list; join with FTS only when searching
+        columns = (
+            "p.path, p.title, p.section, p.date, p.slug, "
+            "p.kind, p.bundle_type, p.draft, p.description, "
+            "p.word_count, p.front_matter"
+        )
+        if include_body:
+            columns += ", p.body"
+
         if search:
-            base = (
-                "SELECT p.path, p.title, p.section, p.date, p.slug, "
-                "p.kind, p.bundle_type, p.draft, p.description, "
-                "p.word_count, p.front_matter"
-                + (", p.body" if include_body else "")
-                + " FROM pages_fts f"
-                " JOIN pages p ON p.path = f.path"
-            )
+            base = f"SELECT {columns} FROM pages_fts f JOIN pages p ON p.path = f.path"
             conds.append("pages_fts MATCH ?")
             params.append(search)
         else:
-            base = (
-                "SELECT p.path, p.title, p.section, p.date, p.slug, "
-                "p.kind, p.bundle_type, p.draft, p.description, "
-                "p.word_count, p.front_matter"
-                + (", p.body" if include_body else "")
-                + " FROM pages p"
-            )
+            base = f"SELECT {columns} FROM pages p"
 
         if tag:
+            tag_taxonomy = _get_tag_taxonomy(_get_config(mcp, ctx))
             conds.append(
                 "EXISTS(SELECT 1 FROM taxonomies t "
-                "WHERE t.page_path = p.path AND t.taxonomy = 'tags' AND t.term = ?)"
+                "WHERE t.page_path = p.path AND t.taxonomy = ? AND t.term = ?)"
             )
-            params.append(tag)
+            params.extend([tag_taxonomy, tag])
 
         where = " AND ".join(conds) if conds else "1=1"
         order = " ORDER BY rank" if search else " ORDER BY p.date DESC NULLS LAST"
@@ -280,22 +297,29 @@ Examples:
         except Exception as e:
             raise ToolError(str(e))
 
-        # Enrich each row with its taxonomy terms
+        if not rows:
+            return []
+
+        # Fetch taxonomies for all returned pages in a single query (avoids N+1).
+        row_paths = [row["path"] for row in rows]
+        tax_placeholders = ",".join("?" for _ in row_paths)
+        tax_rows = database.execute_sql(
+            f"SELECT page_path, taxonomy, term FROM taxonomies "
+            f"WHERE page_path IN ({tax_placeholders})",
+            tuple(row_paths),
+        )
+        taxonomies_by_path: dict[str, dict[str, list[str]]] = {}
+        for tr in tax_rows:
+            taxonomies_by_path.setdefault(tr["page_path"], {}).setdefault(
+                tr["taxonomy"], []
+            ).append(tr["term"])
+
         result = []
         for row in rows:
             page = dict(row)
-            # Parse front_matter from JSON string to dict
             if isinstance(page.get("front_matter"), str):
                 page["front_matter"] = json.loads(page["front_matter"])
-            # Fetch taxonomy terms for this page
-            tax_rows = database.execute_sql(
-                "SELECT taxonomy, term FROM taxonomies WHERE page_path = ?",
-                (page["path"],),
-            )
-            taxonomies = {}
-            for tr in tax_rows:
-                taxonomies.setdefault(tr["taxonomy"], []).append(tr["term"])
-            page["taxonomies"] = taxonomies
+            page["taxonomies"] = taxonomies_by_path.get(page["path"], {})
             result.append(page)
 
         return result
@@ -380,15 +404,17 @@ After creating, call rebuild_index(paths=[result.path]) to add it to the index.
 
         from hugo_memex.writer import create_page as _create
 
-        fm = {"title": title, "draft": draft}
+        # Merge extra first, then let explicit args overwrite — the explicit
+        # parameters are more intentional than a catch-all dict.
+        fm: dict = dict(extra_front_matter) if extra_front_matter else {}
+        fm["title"] = title
+        fm["draft"] = draft
         if description:
             fm["description"] = description
         if tags:
             fm["tags"] = tags
         if categories:
             fm["categories"] = categories
-        if extra_front_matter:
-            fm.update(extra_front_matter)
 
         try:
             return _create(hugo_root, section, slug, fm, body, bundle=bundle)
@@ -432,8 +458,9 @@ with canonical casing (resolves Python/python, AI/ai duplicates).
 Use this when writing new content to pick consistent, relevant tags.
 """
         database = _get_db(mcp, ctx)
+        taxonomy = _get_tag_taxonomy(_get_config(mcp, ctx))
         from hugo_memex.writer import suggest_tags as _suggest
-        return _suggest(database, text, limit=limit)
+        return _suggest(database, text, limit=limit, taxonomy=taxonomy)
 
     @mcp.tool(annotations={"readOnlyHint": True})
     def get_front_matter_template(
@@ -467,8 +494,9 @@ related_posts), and GPG body hash match.
             raise ToolError("hugo_root not configured")
 
         database = _get_db(mcp, ctx)
+        taxonomy = _get_tag_taxonomy(config)
         from hugo_memex.writer import validate_page as _validate
-        return _validate(database, hugo_root, path)
+        return _validate(database, hugo_root, path, tag_taxonomy=taxonomy)
 
 
 def _register_resources(mcp: FastMCP):

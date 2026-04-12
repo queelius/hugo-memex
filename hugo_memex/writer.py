@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,10 +16,11 @@ from typing import Any
 import yaml
 
 from hugo_memex.db import Database
+from hugo_memex.parser import parse_content
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _sha256(text: str) -> str:
@@ -26,9 +29,30 @@ def _sha256(text: str) -> str:
 
 def _dump_front_matter(fm: dict) -> str:
     """Serialize front matter to YAML string between --- delimiters."""
-    # Use default_flow_style=False for readable output,
-    # but flow style for simple lists (tags, categories)
     return yaml.dump(fm, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+
+# Slug must be filesystem-safe: alphanumerics, dash, underscore, dot only.
+# Rejects path separators, `..`, empty, and other surprises.
+_VALID_SLUG = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# Section is stricter: one path component, no separators.
+_VALID_SECTION = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
+
+
+def _resolve_within(root: Path, *parts: str) -> Path:
+    """Resolve a path under root and verify it stays within root.
+
+    Follows symlinks during resolution, so a symlink inside root that
+    points outside is detected (the resolved target won't be under root).
+
+    Raises ValueError if the resolved path escapes root.
+    """
+    root_resolved = root.resolve()
+    target = root.joinpath(*parts).resolve()
+    if not target.is_relative_to(root_resolved):
+        raise ValueError(f"Path escapes content/: {'/'.join(parts)}")
+    return target
 
 
 def create_page(
@@ -53,12 +77,26 @@ def create_page(
     Returns:
         Dict with path (relative to content/), absolute_path, status.
     """
+    # Validate section and slug before touching the filesystem.
+    # These become directory/file names, so we reject anything with
+    # path separators, "..", or other surprises.
+    if not isinstance(section, str) or not _VALID_SECTION.match(section):
+        raise ValueError(
+            f"Invalid section {section!r}: must match [A-Za-z0-9._-]+ "
+            "and contain no path separators"
+        )
+    if not isinstance(slug, str) or not _VALID_SLUG.match(slug):
+        raise ValueError(
+            f"Invalid slug {slug!r}: must match [A-Za-z0-9._-]+ "
+            "and contain no path separators"
+        )
+
     content_root = Path(hugo_root) / "content"
     if not content_root.exists():
         raise FileNotFoundError(f"Content directory not found: {content_root}")
 
-    if "title" not in front_matter:
-        raise ValueError("front_matter must include 'title'")
+    if not front_matter.get("title"):
+        raise ValueError("front_matter must include a non-empty 'title'")
 
     # Set defaults
     fm = dict(front_matter)
@@ -67,18 +105,31 @@ def create_page(
     if "draft" not in fm:
         fm["draft"] = True
 
-    # Determine file path
+    content_root_resolved = content_root.resolve()
+
+    # Build the target directory and file path.
+    # Create the directory, then resolve it (following symlinks) and verify
+    # containment. If any parent is a symlink escaping content/, this catches it.
     if bundle:
         page_dir = content_root / section / slug
-        page_dir.mkdir(parents=True, exist_ok=True)
         file_path = page_dir / "index.md"
     else:
-        (content_root / section).mkdir(parents=True, exist_ok=True)
-        file_path = content_root / section / f"{slug}.md"
+        page_dir = content_root / section
+        file_path = page_dir / f"{slug}.md"
+
+    page_dir.mkdir(parents=True, exist_ok=True)
+
+    if not page_dir.resolve().is_relative_to(content_root_resolved):
+        raise ValueError(f"Target directory escapes content/: {page_dir}")
+
+    # Refuse to write through a symlink at the target path — even a dangling
+    # one, since write_text would create the symlink target.
+    if file_path.is_symlink():
+        raise ValueError(f"Refusing to write through symlink at {file_path}")
 
     if file_path.exists():
         raise FileExistsError(
-            f"Page already exists: {file_path.relative_to(content_root)}"
+            f"Page already exists: {file_path.relative_to(content_root_resolved)}"
         )
 
     # Build file content
@@ -86,7 +137,7 @@ def create_page(
     content = f"---\n{fm_text}---\n\n{body}\n"
     file_path.write_text(content, encoding="utf-8")
 
-    rel_path = str(file_path.relative_to(content_root))
+    rel_path = str(file_path.relative_to(content_root_resolved))
     return {
         "path": rel_path,
         "absolute_path": str(file_path),
@@ -111,17 +162,33 @@ def update_page(
     Returns:
         Dict with path, status, changes summary.
     """
-    from hugo_memex.parser import parse_content
-
     content_root = Path(hugo_root) / "content"
     file_path = (content_root / path).resolve()
 
     if not file_path.is_relative_to(content_root.resolve()):
         raise ValueError("Path must be within content/ directory")
+    if file_path.is_symlink():
+        raise ValueError(f"Refusing to write through symlink at {path}")
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
     raw = file_path.read_text(encoding="utf-8-sig")
+
+    # Only support YAML front matter in update_page. TOML (+++) and JSON ({)
+    # round-trip would require extra deps (tomli_w) and format-specific escaping.
+    # Silently converting formats would mangle the user's site.
+    stripped = raw.lstrip("\ufeff").lstrip("\n")
+    if stripped.startswith("+++"):
+        raise ValueError(
+            f"TOML front matter not supported by update_page: {path}. "
+            "Edit the file directly or convert to YAML front matter."
+        )
+    if stripped.startswith("{"):
+        raise ValueError(
+            f"JSON front matter not supported by update_page: {path}. "
+            "Edit the file directly or convert to YAML front matter."
+        )
+
     existing_fm, existing_body = parse_content(raw)
 
     changes = []
@@ -173,32 +240,27 @@ def get_front_matter_template(db: Database, section: str) -> dict:
         fm = json.loads(row["front_matter"]) if isinstance(row["front_matter"], str) else row["front_matter"]
         for key, value in fm.items():
             if key not in key_stats:
-                key_stats[key] = {"count": 0, "examples": [], "types": set()}
+                key_stats[key] = {"count": 0, "examples": [], "types": Counter()}
             key_stats[key]["count"] += 1
-            key_stats[key]["types"].add(type(value).__name__)
+            key_stats[key]["types"][type(value).__name__] += 1
             if len(key_stats[key]["examples"]) < 3 and value:
                 key_stats[key]["examples"].append(value)
 
-    # Build template: keys appearing in >50% of pages
+    # Sensible defaults per primary type
+    _defaults = {
+        "list": lambda: [],
+        "dict": lambda: {},
+        "bool": lambda: False,
+        "str": lambda: "",
+    }
+
     template = {}
     for key, stats in sorted(key_stats.items(), key=lambda x: -x[1]["count"]):
         frequency = stats["count"] / total
-        primary_type = max(stats["types"], key=lambda t: 1)  # most common type
+        # Pick the most frequent observed type for this key across pages.
+        primary_type = stats["types"].most_common(1)[0][0]
         example = stats["examples"][0] if stats["examples"] else None
-
-        # Generate sensible defaults
-        if primary_type == "list":
-            default = []
-        elif primary_type == "dict":
-            default = {}
-        elif primary_type == "bool":
-            default = False
-        elif primary_type == "str":
-            default = ""
-        elif primary_type == "NoneType":
-            default = None
-        else:
-            default = None
+        default = _defaults.get(primary_type, lambda: None)()
 
         template[key] = {
             "type": primary_type,
@@ -210,28 +272,37 @@ def get_front_matter_template(db: Database, section: str) -> dict:
     return template
 
 
+_FTS_TOKEN = re.compile(r"[A-Za-z0-9_-]+")
+
+
 def suggest_tags(
     db: Database, text: str, limit: int = 10,
+    taxonomy: str = "tags",
 ) -> list[dict]:
     """Suggest existing tags based on content text.
 
     Uses FTS5 to find pages similar to the given text, then returns
     the most common tags among those pages, weighted by frequency.
     Also returns the canonical form (most-used casing) for each tag.
+
+    Args:
+        taxonomy: Which taxonomy table to search. Defaults to 'tags'.
+            For sites with custom taxonomy names, derive from hugo.toml.
     """
-    # Find similar pages via FTS5
-    # Extract key terms from the text (first 200 words)
-    words = text.split()[:200]
-    # Filter to meaningful words (>3 chars, not common stopwords)
-    terms = [w.strip(".,;:!?\"'()[]{}") for w in words if len(w) > 3]
+    # Tokenize the input into FTS-safe terms: alphanumerics, hyphen, underscore.
+    # This strips any characters that would break FTS5 phrase syntax (quotes,
+    # AND/OR/NEAR would still be strings, but quoting them as phrases is safe).
+    terms = [t for t in _FTS_TOKEN.findall(text) if len(t) > 3]
     if not terms:
         return []
 
-    # Build an OR query from the terms
+    # Build a ranked OR query. Each term is quoted as an FTS5 phrase,
+    # which disables operator interpretation (so "AND", "NEAR" etc. are literal).
     fts_query = " OR ".join(f'"{t}"' for t in terms[:30])
     try:
         similar_pages = db.execute_sql(
-            "SELECT path FROM pages_fts WHERE pages_fts MATCH ? LIMIT 50",
+            "SELECT path FROM pages_fts WHERE pages_fts MATCH ? "
+            "ORDER BY rank LIMIT 50",
             (fts_query,),
         )
     except Exception:
@@ -246,35 +317,43 @@ def suggest_tags(
     # Get tag frequencies among similar pages
     tag_rows = db.execute_sql(
         f"SELECT term, COUNT(*) as freq FROM taxonomies "
-        f"WHERE page_path IN ({placeholders}) AND taxonomy = 'tags' "
+        f"WHERE page_path IN ({placeholders}) AND taxonomy = ? "
         f"GROUP BY term ORDER BY freq DESC LIMIT ?",
-        (*paths, limit * 3),  # fetch extra to handle dedup
+        (*paths, taxonomy, limit * 3),
     )
+    if not tag_rows:
+        return []
 
-    # Normalize: find the canonical (most-used) form for each tag
+    # Resolve canonical (most-used) casing in one batched query.
+    lowered = {row["term"].lower() for row in tag_rows}
+    lower_placeholders = ",".join("?" for _ in lowered)
+    canonical_rows = db.execute_sql(
+        f"SELECT term, COUNT(*) as n FROM taxonomies "
+        f"WHERE taxonomy = ? AND LOWER(term) IN ({lower_placeholders}) "
+        f"GROUP BY term",
+        (taxonomy, *lowered),
+    )
+    canonical: dict[str, tuple[str, int]] = {}
+    for cr in canonical_rows:
+        lower = cr["term"].lower()
+        if lower not in canonical or cr["n"] > canonical[lower][1]:
+            canonical[lower] = (cr["term"], cr["n"])
+
     seen_lower: dict[str, dict] = {}
     for row in tag_rows:
         lower = row["term"].lower()
         if lower not in seen_lower:
-            # Find the most-used casing globally
-            canonical_rows = db.execute_sql(
-                "SELECT term, COUNT(*) as n FROM taxonomies "
-                "WHERE taxonomy = 'tags' AND LOWER(term) = ? "
-                "GROUP BY term ORDER BY n DESC LIMIT 1",
-                (lower,),
-            )
-            canonical = canonical_rows[0]["term"] if canonical_rows else row["term"]
             seen_lower[lower] = {
-                "tag": canonical,
+                "tag": canonical.get(lower, (row["term"], 0))[0],
                 "relevance": row["freq"],
             }
 
-    results = list(seen_lower.values())[:limit]
-    return results
+    return list(seen_lower.values())[:limit]
 
 
 def validate_page(
     db: Database, hugo_root: str, path: str,
+    tag_taxonomy: str = "tags",
 ) -> dict:
     """Validate a page for completeness and consistency.
 
@@ -283,9 +362,10 @@ def validate_page(
     - Tag case consistency (flags duplicates)
     - Cross-reference validity (linked_project, related_posts)
     - GPG body hash match (if present)
-    """
-    from hugo_memex.parser import parse_content
 
+    Args:
+        tag_taxonomy: Which taxonomy the site uses for tags. Defaults to 'tags'.
+    """
     content_root = Path(hugo_root) / "content"
     file_path = content_root / path
     if not file_path.exists():
@@ -301,25 +381,32 @@ def validate_page(
         if not fm.get(field):
             issues.append({"severity": "error", "field": field, "message": f"Missing required field: {field}"})
 
-    if not fm.get("tags"):
-        issues.append({"severity": "warning", "field": "tags", "message": "No tags defined"})
+    tags = fm.get(tag_taxonomy)
+    if not tags:
+        issues.append({"severity": "warning", "field": tag_taxonomy, "message": f"No {tag_taxonomy} defined"})
 
     # Tag case consistency
-    tags = fm.get("tags", [])
     if isinstance(tags, list):
         for tag in tags:
+            if not isinstance(tag, str):
+                issues.append({
+                    "severity": "warning",
+                    "field": tag_taxonomy,
+                    "message": f"Non-string {tag_taxonomy} entry: {tag!r}",
+                })
+                continue
             variants = db.execute_sql(
                 "SELECT term, COUNT(*) as n FROM taxonomies "
-                "WHERE taxonomy = 'tags' AND LOWER(term) = ? "
+                "WHERE taxonomy = ? AND LOWER(term) = ? "
                 "GROUP BY term ORDER BY n DESC",
-                (tag.lower(),),
+                (tag_taxonomy, tag.lower()),
             )
             if len(variants) > 1:
                 canonical = variants[0]["term"]
                 if tag != canonical:
                     issues.append({
                         "severity": "warning",
-                        "field": "tags",
+                        "field": tag_taxonomy,
                         "message": f"Tag '{tag}' has a more common variant: '{canonical}' (used {variants[0]['n']}x vs your form)",
                     })
 
