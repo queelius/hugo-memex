@@ -498,6 +498,72 @@ related_posts), and GPG body hash match.
         from hugo_memex.writer import validate_page as _validate
         return _validate(database, hugo_root, path, tag_taxonomy=taxonomy)
 
+    # -- Marginalia tools -----------------------------------------
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    def get_marginalia(
+        page_path: Annotated[str, Field(description="Content path relative to content/ (e.g. 'post/my-post/index.md')")],
+        ctx: Context | None = None,
+    ) -> list[dict]:
+        """Get all marginalia notes for a page.
+
+Returns notes ordered by creation time. Each note has id, body, created_at,
+page_path, and source_file fields.
+"""
+        return _get_db(mcp, ctx).get_marginalia(page_path)
+
+    @mcp.tool()
+    def add_marginalia(
+        page_path: Annotated[str, Field(description="Content path relative to content/ (e.g. 'post/my-post/index.md')")],
+        body: Annotated[str, Field(description="Note body text (markdown supported)")],
+        ctx: Context | None = None,
+    ) -> dict:
+        """Add a marginalia note to a content page.
+
+Creates (or appends to) a YAML file under data/marginalia/.
+Call rebuild_index() after to update the search index.
+"""
+        config = _get_config(mcp, ctx)
+        hugo_root = config.get("hugo_root")
+        if not hugo_root:
+            raise ToolError("hugo_root not configured")
+
+        from hugo_memex.writer import add_marginalia as _add
+
+        try:
+            return _add(hugo_root, page_path, body)
+        except (ValueError, FileNotFoundError) as e:
+            raise ToolError(str(e))
+
+    @mcp.tool()
+    def delete_marginalia(
+        id: Annotated[str, Field(description="Marginalia note ID (e.g. 'mg-abc123def456')")],
+        ctx: Context | None = None,
+    ) -> dict:
+        """Delete a marginalia note by ID.
+
+Removes the note from its YAML file on disk. If the file becomes empty,
+the file itself is removed. Call rebuild_index() after to update the index.
+"""
+        config = _get_config(mcp, ctx)
+        hugo_root = config.get("hugo_root")
+        if not hugo_root:
+            raise ToolError("hugo_root not configured")
+
+        database = _get_db(mcp, ctx)
+        rows = database.execute_sql(
+            "SELECT source_file FROM marginalia WHERE id = ?", (id,)
+        )
+        if not rows:
+            raise ToolError(f"Marginalia note not found: {id}")
+
+        from hugo_memex.writer import delete_marginalia_from_disk
+
+        try:
+            return delete_marginalia_from_disk(hugo_root, rows[0]["source_file"], id)
+        except (ValueError, FileNotFoundError) as e:
+            raise ToolError(str(e))
+
 
 def _register_resources(mcp: FastMCP):
     """Register all MCP resources.

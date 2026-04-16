@@ -327,6 +327,9 @@ class TestServerSetup:
         assert "execute_sql" in tool_names
         assert "get_content" in tool_names
         assert "rebuild_index" in tool_names
+        assert "get_marginalia" in tool_names
+        assert "add_marginalia" in tool_names
+        assert "delete_marginalia" in tool_names
 
     @pytest.mark.asyncio
     async def test_resources_registered(self, mcp_server):
@@ -369,3 +372,61 @@ class TestCreatePageWrapper:
                 section="post", slug="../../../tmp/evil",
                 title="x", body="body",
             )
+
+
+class TestGetMarginalia:
+    @pytest.mark.asyncio
+    async def test_get_marginalia(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_marginalia")
+        result = fn(page_path="post/test-post/index.md")
+        assert len(result) >= 2
+
+    @pytest.mark.asyncio
+    async def test_get_marginalia_empty(self, mcp_server):
+        fn = await _get_tool_fn(mcp_server, "get_marginalia")
+        result = fn(page_path="nonexistent/page.md")
+        assert result == []
+
+
+class TestAddMarginalia:
+    @pytest.mark.asyncio
+    async def test_add_marginalia(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        fn = await _get_tool_fn(server, "add_marginalia")
+        result = fn(page_path="post/test-post/index.md", body="A new note")
+        assert result["status"] == "created"
+        assert result["id"].startswith("mg-")
+        # Verify the YAML file was written to disk
+        yaml_path = site / result["source_file"]
+        assert yaml_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_add_marginalia_path_traversal(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        fn = await _get_tool_fn(server, "add_marginalia")
+        with pytest.raises(Exception, match="escapes"):
+            fn(page_path="../../etc/passwd", body="evil")
+
+
+class TestDeleteMarginalia:
+    @pytest.mark.asyncio
+    async def test_delete_marginalia(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        # First add a note so we have something to delete
+        add_fn = await _get_tool_fn(server, "add_marginalia")
+        added = add_fn(page_path="post/test-post/index.md", body="Note to delete")
+        note_id = added["id"]
+        # Re-index so the DB knows about the new note
+        rebuild_fn = await _get_tool_fn(server, "rebuild_index")
+        rebuild_fn(force=True)
+        # Now delete it
+        del_fn = await _get_tool_fn(server, "delete_marginalia")
+        result = del_fn(id=note_id)
+        assert result["status"] == "deleted"
+
+    @pytest.mark.asyncio
+    async def test_delete_marginalia_not_found(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        fn = await _get_tool_fn(server, "delete_marginalia")
+        with pytest.raises(Exception):
+            fn(id="mg-nonexistent")
