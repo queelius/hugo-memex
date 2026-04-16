@@ -40,6 +40,174 @@ _VALID_SLUG = re.compile(r"^[A-Za-z0-9._-]+$")
 _VALID_SECTION = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
 
 
+# ---------------------------------------------------------------------------
+# Marginalia path mapping and disk I/O
+# ---------------------------------------------------------------------------
+
+def _marginalia_id(page_path: str, body: str, created: str) -> str:
+    """Generate a deterministic marginalia note ID.
+
+    Returns ``mg-`` followed by the first 12 hex characters of a SHA-256
+    digest of the concatenation ``page_path + '\\n' + body + '\\n' + created``.
+    """
+    digest = hashlib.sha256(
+        (page_path + "\n" + body + "\n" + created).encode()
+    ).hexdigest()
+    return "mg-" + digest[:12]
+
+
+def marginalia_path_for_page(hugo_root: str, page_path: str) -> Path:
+    """Map a content path to the corresponding marginalia YAML file.
+
+    Validates that *page_path* stays within ``content/`` (path traversal
+    protection using the same ``resolve() + is_relative_to()`` pattern as
+    ``create_page``).
+
+    Mapping rules::
+
+        post/my-post/index.md   -> data/marginalia/post/my-post.yaml
+        media/book.md           -> data/marginalia/media/book.yaml
+        _index.md               -> data/marginalia/_index.yaml
+        section/_index.md       -> data/marginalia/section/_index.yaml
+    """
+    root = Path(hugo_root)
+    content_root = root / "content"
+
+    # Path traversal guard
+    target = (content_root / page_path).resolve()
+    if not target.is_relative_to(content_root.resolve()):
+        raise ValueError(f"Path escapes content/: {page_path}")
+
+    p = Path(page_path)
+
+    if p.name == "index.md":
+        # Leaf bundle: strip index.md, use parent dir name as stem
+        # e.g. post/my-post/index.md -> post/my-post.yaml
+        stem_path = p.parent
+        yaml_rel = stem_path.with_suffix(".yaml")
+    elif p.name == "_index.md":
+        # Section or root index
+        # e.g. _index.md -> _index.yaml
+        # e.g. section/_index.md -> section/_index.yaml
+        yaml_rel = p.with_suffix(".yaml")
+    else:
+        # Standalone file: strip .md, add .yaml
+        # e.g. media/book.md -> media/book.yaml
+        yaml_rel = p.with_suffix(".yaml")
+
+    return root / "data" / "marginalia" / yaml_rel
+
+
+def page_path_for_marginalia(marginalia_rel_path: str) -> str:
+    """Reverse-map a marginalia file path to its content page path.
+
+    The *marginalia_rel_path* is relative to ``data/marginalia/``.
+
+    Mapping rules (default assumption: non-index stems are leaf bundles)::
+
+        post/test-post.yaml     -> post/test-post/index.md
+        _index.yaml             -> _index.md
+        section/_index.yaml     -> section/_index.md
+    """
+    p = Path(marginalia_rel_path)
+    stem = p.stem  # e.g. "test-post" or "_index"
+
+    if stem == "_index":
+        # _index.yaml -> _index.md (preserving parent dirs)
+        return str(p.with_suffix(".md"))
+    else:
+        # post/test-post.yaml -> post/test-post/index.md
+        return str(p.parent / stem / "index.md")
+
+
+def add_marginalia(hugo_root: str, page_path: str, body: str) -> dict:
+    """Add a marginalia note for the given content page.
+
+    Creates (or appends to) the YAML file under ``data/marginalia/``.
+
+    Returns:
+        Dict with ``id``, ``page_path``, ``source_file``, ``status``.
+    """
+    yaml_path = marginalia_path_for_page(hugo_root, page_path)
+
+    created = _now_iso()
+    note_id = _marginalia_id(page_path, body, created)
+
+    note = {
+        "id": note_id,
+        "body": body,
+        "created": created,
+    }
+
+    # Read existing notes or start fresh
+    if yaml_path.exists():
+        raw = yaml_path.read_text(encoding="utf-8")
+        notes = yaml.safe_load(raw)
+        if not isinstance(notes, list):
+            notes = []
+    else:
+        notes = []
+
+    notes.append(note)
+
+    # Ensure parent directories exist
+    yaml_path.parent.mkdir(parents=True, exist_ok=True)
+
+    yaml_path.write_text(
+        yaml.dump(notes, default_flow_style=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    root = Path(hugo_root)
+    source_file = str(yaml_path.relative_to(root))
+
+    return {
+        "id": note_id,
+        "page_path": page_path,
+        "source_file": source_file,
+        "status": "created",
+    }
+
+
+def delete_marginalia_from_disk(
+    hugo_root: str, source_file: str, note_id: str,
+) -> dict:
+    """Delete a single marginalia note from a YAML file.
+
+    If the file becomes empty after deletion, the file itself is removed.
+
+    Returns:
+        Dict with ``id``, ``status``.
+
+    Raises:
+        ValueError: If the note ID is not found in the file.
+    """
+    root = Path(hugo_root)
+    yaml_path = root / source_file
+
+    if not yaml_path.exists():
+        raise ValueError(f"Marginalia note {note_id!r} not found")
+
+    raw = yaml_path.read_text(encoding="utf-8")
+    notes = yaml.safe_load(raw)
+    if not isinstance(notes, list):
+        raise ValueError(f"Marginalia note {note_id!r} not found")
+
+    remaining = [n for n in notes if n.get("id") != note_id]
+    if len(remaining) == len(notes):
+        raise ValueError(f"Marginalia note {note_id!r} not found")
+
+    if remaining:
+        yaml_path.write_text(
+            yaml.dump(remaining, default_flow_style=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+    else:
+        yaml_path.unlink()
+
+    return {"id": note_id, "status": "deleted"}
+
+
 def _resolve_within(root: Path, *parts: str) -> Path:
     """Resolve a path under root and verify it stays within root.
 

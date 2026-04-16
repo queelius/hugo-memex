@@ -8,8 +8,13 @@ from hugo_memex.db import Database
 from hugo_memex.indexer import index_content
 from hugo_memex.parser import parse_content
 from hugo_memex.writer import (
+    _marginalia_id,
+    add_marginalia,
     create_page,
+    delete_marginalia_from_disk,
     get_front_matter_template,
+    marginalia_path_for_page,
+    page_path_for_marginalia,
     suggest_tags,
     update_page,
     validate_page,
@@ -403,3 +408,148 @@ class TestFrontMatterTemplateTypes:
         assert template["title"]["type"] == "str"
         # Defaults match the primary type
         assert template["title"]["default"] == ""
+
+
+class TestMarginaliaPathMapping:
+    """Tests for marginalia_path_for_page and page_path_for_marginalia."""
+
+    def test_leaf_bundle(self, writable_site):
+        site, _ = writable_site
+        result = marginalia_path_for_page(str(site), "post/test-post/index.md")
+        expected = Path(str(site)) / "data" / "marginalia" / "post" / "test-post.yaml"
+        assert result == expected
+
+    def test_standalone_file(self, writable_site):
+        site, _ = writable_site
+        result = marginalia_path_for_page(str(site), "media/test-book.md")
+        expected = Path(str(site)) / "data" / "marginalia" / "media" / "test-book.yaml"
+        assert result == expected
+
+    def test_root_index(self, writable_site):
+        site, _ = writable_site
+        result = marginalia_path_for_page(str(site), "_index.md")
+        expected = Path(str(site)) / "data" / "marginalia" / "_index.yaml"
+        assert result == expected
+
+    def test_reverse_mapping_leaf_bundle(self):
+        result = page_path_for_marginalia("post/test-post.yaml")
+        assert result == "post/test-post/index.md"
+
+    def test_reverse_mapping_standalone(self):
+        # Default assumption: non-index yaml maps to leaf bundle
+        result = page_path_for_marginalia("media/test-book.yaml")
+        assert result == "media/test-book/index.md"
+
+    def test_reverse_mapping_root_index(self):
+        result = page_path_for_marginalia("_index.yaml")
+        assert result == "_index.md"
+
+    def test_path_traversal_rejected(self, writable_site):
+        site, _ = writable_site
+        with pytest.raises(ValueError):
+            marginalia_path_for_page(str(site), "../../etc/passwd")
+
+
+class TestAddMarginalia:
+    """Tests for add_marginalia disk writer."""
+
+    def test_add_first_note(self, writable_site):
+        site, _ = writable_site
+        result = add_marginalia(str(site), "post/test-post/index.md", "My first note")
+        assert result["status"] == "created"
+        assert result["page_path"] == "post/test-post/index.md"
+        assert "id" in result
+        assert result["id"].startswith("mg-")
+
+        # Verify file was created with correct content
+        yaml_path = Path(result["source_file"])
+        full_path = Path(str(site)) / yaml_path
+        assert full_path.exists()
+
+        import yaml as _yaml
+        notes = _yaml.safe_load(full_path.read_text(encoding="utf-8"))
+        assert len(notes) == 1
+        assert notes[0]["body"] == "My first note"
+        assert notes[0]["id"] == result["id"]
+        assert "created" in notes[0]
+
+    def test_add_second_note_appends(self, writable_site):
+        site, _ = writable_site
+        add_marginalia(str(site), "post/test-post/index.md", "Note one")
+        add_marginalia(str(site), "post/test-post/index.md", "Note two")
+
+        yaml_path = (
+            Path(str(site)) / "data" / "marginalia" / "post" / "test-post.yaml"
+        )
+        import yaml as _yaml
+        notes = _yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        assert len(notes) == 2
+        assert notes[0]["body"] == "Note one"
+        assert notes[1]["body"] == "Note two"
+
+    def test_add_creates_directories(self, writable_site):
+        site, _ = writable_site
+        # The data/marginalia/post/ directory should not exist yet
+        marginalia_dir = Path(str(site)) / "data" / "marginalia" / "post"
+        assert not marginalia_dir.exists()
+
+        add_marginalia(str(site), "post/test-post/index.md", "A note")
+        assert marginalia_dir.exists()
+
+    def test_add_path_traversal_rejected(self, writable_site):
+        site, _ = writable_site
+        with pytest.raises(ValueError):
+            add_marginalia(str(site), "../../etc/passwd", "Evil note")
+
+    def test_deterministic_ids(self):
+        """_marginalia_id produces deterministic, well-formed IDs."""
+        id1 = _marginalia_id("post/test/index.md", "body text", "2024-01-01T00:00:00Z")
+        id2 = _marginalia_id("post/test/index.md", "body text", "2024-01-01T00:00:00Z")
+        assert id1 == id2
+        assert id1.startswith("mg-")
+        assert len(id1) == 15  # "mg-" (3) + 12 hex chars
+
+        # Different inputs produce different IDs
+        id3 = _marginalia_id("post/other/index.md", "body text", "2024-01-01T00:00:00Z")
+        assert id3 != id1
+
+
+class TestDeleteMarginaliaFromDisk:
+    """Tests for delete_marginalia_from_disk."""
+
+    def test_delete_note(self, writable_site):
+        site, _ = writable_site
+        r1 = add_marginalia(str(site), "post/test-post/index.md", "Note one")
+        r2 = add_marginalia(str(site), "post/test-post/index.md", "Note two")
+
+        result = delete_marginalia_from_disk(str(site), r1["source_file"], r1["id"])
+        assert result["status"] == "deleted"
+        assert result["id"] == r1["id"]
+
+        # Verify only one note remains
+        import yaml as _yaml
+        full_path = Path(str(site)) / r1["source_file"]
+        notes = _yaml.safe_load(full_path.read_text(encoding="utf-8"))
+        assert len(notes) == 1
+        assert notes[0]["id"] == r2["id"]
+
+    def test_delete_last_note_removes_file(self, writable_site):
+        site, _ = writable_site
+        r1 = add_marginalia(str(site), "post/test-post/index.md", "Only note")
+
+        full_path = Path(str(site)) / r1["source_file"]
+        assert full_path.exists()
+
+        delete_marginalia_from_disk(str(site), r1["source_file"], r1["id"])
+        assert not full_path.exists()
+
+    def test_delete_not_found(self, writable_site):
+        site, _ = writable_site
+        add_marginalia(str(site), "post/test-post/index.md", "A note")
+
+        with pytest.raises(ValueError, match="not found"):
+            delete_marginalia_from_disk(
+                str(site),
+                "data/marginalia/post/test-post.yaml",
+                "mg-nonexistent00",
+            )
