@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Callable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -58,6 +58,23 @@ CREATE INDEX IF NOT EXISTS idx_pages_draft ON pages(draft);
 CREATE INDEX IF NOT EXISTS idx_pages_section_date ON pages(section, date DESC);
 CREATE INDEX IF NOT EXISTS idx_taxonomies_term ON taxonomies(taxonomy, term);
 CREATE INDEX IF NOT EXISTS idx_taxonomies_page ON taxonomies(page_path);
+
+CREATE TABLE IF NOT EXISTS marginalia (
+    id TEXT PRIMARY KEY,
+    page_path TEXT,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    source_file TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_marginalia_page ON marginalia(page_path);
+CREATE INDEX IF NOT EXISTS idx_marginalia_source ON marginalia(source_file);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS marginalia_fts USING fts5(
+    id UNINDEXED,
+    body,
+    tokenize = 'porter unicode61'
+);
 """
 
 
@@ -177,7 +194,7 @@ class Database:
 
     def get_schema(self) -> str:
         """Return DDL + relationship docs for the LLM."""
-        skip_prefixes = ("pages_fts_", "schema_version")
+        skip_prefixes = ("pages_fts_", "marginalia_fts_", "schema_version")
         rows = self.execute_sql(
             "SELECT name, sql FROM sqlite_master "
             "WHERE sql IS NOT NULL ORDER BY type, name"
@@ -411,6 +428,102 @@ class Database:
         rows = self.execute_sql("SELECT path FROM pages")
         return {r["path"] for r in rows}
 
+    # ── Marginalia CRUD ─────────────────────────────────────────
+
+    def save_marginalia(self, note: dict) -> None:
+        """Insert or replace a marginalia record and update FTS5."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO marginalia "
+            "(id, page_path, body, created_at, source_file) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                note["id"], note.get("page_path"), note["body"],
+                note["created_at"], note["source_file"],
+            ),
+        )
+        self.conn.execute(
+            "DELETE FROM marginalia_fts WHERE id = ?", (note["id"],)
+        )
+        self.conn.execute(
+            "INSERT INTO marginalia_fts (id, body) VALUES (?, ?)",
+            (note["id"], note["body"]),
+        )
+        self.conn.commit()
+
+    def get_marginalia(self, page_path: str) -> list[dict]:
+        """Return all marginalia for a page, ordered by created_at."""
+        return self.execute_sql(
+            "SELECT * FROM marginalia WHERE page_path = ? "
+            "ORDER BY created_at",
+            (page_path,),
+        )
+
+    def delete_marginalia(self, note_id: str) -> bool:
+        """Delete a marginalia record and its FTS entry. Returns True if found."""
+        try:
+            self.conn.execute(
+                "DELETE FROM marginalia_fts WHERE id = ?", (note_id,)
+            )
+            cursor = self.conn.execute(
+                "DELETE FROM marginalia WHERE id = ?", (note_id,)
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_all_marginalia_source_files(self) -> set[str]:
+        """Return distinct source_file values from marginalia."""
+        rows = self.execute_sql(
+            "SELECT DISTINCT source_file FROM marginalia"
+        )
+        return {r["source_file"] for r in rows}
+
+    def delete_marginalia_by_source(self, source_file: str) -> int:
+        """Delete all marginalia from a source file. Returns count deleted."""
+        try:
+            # Get IDs to clean from FTS
+            ids = self.execute_sql(
+                "SELECT id FROM marginalia WHERE source_file = ?",
+                (source_file,),
+            )
+            for row in ids:
+                self.conn.execute(
+                    "DELETE FROM marginalia_fts WHERE id = ?", (row["id"],)
+                )
+            cursor = self.conn.execute(
+                "DELETE FROM marginalia WHERE source_file = ?",
+                (source_file,),
+            )
+            self.conn.commit()
+            return cursor.rowcount
+        except Exception:
+            self.conn.rollback()
+            raise
+
+
+def _migrate_v1_to_v2(conn):
+    """Add marginalia tables."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS marginalia (
+            id TEXT PRIMARY KEY,
+            page_path TEXT,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            source_file TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_marginalia_page ON marginalia(page_path);
+        CREATE INDEX IF NOT EXISTS idx_marginalia_source ON marginalia(source_file);
+        CREATE VIRTUAL TABLE IF NOT EXISTS marginalia_fts USING fts5(
+            id UNINDEXED,
+            body,
+            tokenize = 'porter unicode61'
+        );
+    """)
+
 
 # Migration registry (version_from → migration_fn)
-_MIGRATIONS: dict[int, Callable] = {}
+_MIGRATIONS: dict[int, Callable] = {
+    1: _migrate_v1_to_v2,
+}
