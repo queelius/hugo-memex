@@ -247,7 +247,27 @@ class Database:
 --   WHERE t.taxonomy = 'tags' AND t.term = 'python'
 --
 --   SELECT t.term, COUNT(*) as count FROM taxonomies t
---   WHERE t.taxonomy = 'tags' GROUP BY t.term ORDER BY count DESC"""
+--   WHERE t.taxonomy = 'tags' GROUP BY t.term ORDER BY count DESC
+
+-- ══ Marginalia Queries ═════════════════════════════════════════
+-- marginalia stores free-form notes attached to pages.
+-- marginalia_fts indexes note body with porter stemming.
+--
+-- All notes for a page:
+--   SELECT id, body, created_at FROM marginalia
+--   WHERE page_path = 'post/my-post/index.md'
+--   ORDER BY created_at
+--
+-- FTS search across all marginalia:
+--   SELECT m.id, m.page_path, m.body
+--   FROM marginalia_fts f
+--   JOIN marginalia m ON m.id = f.id
+--   WHERE marginalia_fts MATCH 'search terms'
+--   ORDER BY rank LIMIT 20
+--
+-- Orphaned marginalia (page deleted but notes survive):
+--   SELECT id, page_path, body FROM marginalia
+--   WHERE page_path NOT IN (SELECT path FROM pages)"""
         return ddl + docs
 
     # ── Statistics ───────────────────────────────────────────────
