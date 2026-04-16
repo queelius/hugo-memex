@@ -27,6 +27,10 @@ def writable_site(tmp_path, fixtures_dir):
     import shutil
     site = tmp_path / "site"
     shutil.copytree(fixtures_dir, site)
+    # Remove fixture marginalia so writer tests start from a clean slate
+    marginalia_dir = site / "data" / "marginalia"
+    if marginalia_dir.exists():
+        shutil.rmtree(marginalia_dir)
     db = Database(":memory:")
     stats = index_content(str(site), db)
     assert stats["errors"] == []

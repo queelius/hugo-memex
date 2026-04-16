@@ -1,0 +1,6 @@
+- id: "mg-fixture00001"
+  created: "2026-04-15T10:00:00Z"
+  body: "This fixture note references Python and SQLite integration."
+- id: "mg-fixture00002"
+  created: "2026-04-16T09:00:00Z"
+  body: "Related to llm-memex://conversation/test-convo-123"

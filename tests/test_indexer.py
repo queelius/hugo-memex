@@ -11,6 +11,7 @@ from hugo_memex.indexer import (
     extract_taxonomies,
     index_content,
 )
+from hugo_memex.writer import page_path_for_marginalia
 
 
 class TestDiscoverContent:
@@ -211,3 +212,56 @@ class TestIndexContent:
         assert len(tax_stats) > 0
 
         db.close()
+
+
+class TestMarginaliaIndexing:
+    def test_index_discovers_marginalia(self, hugo_root, db):
+        """index_content discovers and indexes marginalia YAML files."""
+        stats = index_content(str(hugo_root), db)
+        assert stats["marginalia_indexed"] >= 2
+
+    def test_indexed_marginalia_queryable(self, hugo_root, db):
+        """Indexed marginalia are queryable via db.get_marginalia."""
+        index_content(str(hugo_root), db)
+        notes = db.get_marginalia("post/test-post/index.md")
+        ids = {n["id"] for n in notes}
+        assert "mg-fixture00001" in ids
+        assert "mg-fixture00002" in ids
+
+    def test_marginalia_fts_populated(self, hugo_root, db):
+        """Marginalia body text is indexed in FTS5."""
+        index_content(str(hugo_root), db)
+        rows = db.execute_sql(
+            "SELECT id FROM marginalia_fts WHERE marginalia_fts MATCH 'Python'"
+        )
+        ids = {r["id"] for r in rows}
+        assert "mg-fixture00001" in ids
+
+    def test_marginalia_incremental(self, hugo_root, db):
+        """Second index run skips unchanged marginalia files."""
+        stats1 = index_content(str(hugo_root), db)
+        assert stats1["marginalia_indexed"] >= 2
+
+        stats2 = index_content(str(hugo_root), db)
+        assert stats2["marginalia_indexed"] == 0
+        assert stats2["marginalia_unchanged"] >= 1
+
+    def test_marginalia_force_reindex(self, hugo_root, db):
+        """Force reindex re-processes all marginalia files."""
+        index_content(str(hugo_root), db)
+        stats = index_content(str(hugo_root), db, force=True)
+        assert stats["marginalia_indexed"] >= 2
+
+    def test_marginalia_orphan_survives_page_delete(self, hugo_root, db):
+        """Marginalia survive when their associated page is deleted."""
+        index_content(str(hugo_root), db)
+        # Verify marginalia exist
+        notes_before = db.get_marginalia("post/test-post/index.md")
+        assert len(notes_before) >= 2
+
+        # Delete the page
+        db.delete_page("post/test-post/index.md")
+
+        # Marginalia should still be there (orphan survival)
+        notes_after = db.get_marginalia("post/test-post/index.md")
+        assert len(notes_after) == len(notes_before)

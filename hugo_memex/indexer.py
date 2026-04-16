@@ -10,9 +10,12 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from hugo_memex.config import load_hugo_config, get_taxonomies
 from hugo_memex.db import Database
 from hugo_memex.parser import parse_content
+from hugo_memex.writer import page_path_for_marginalia
 
 
 def _now_iso() -> str:
@@ -57,6 +60,14 @@ def discover_content(content_dir: Path) -> list[Path]:
     if not content_dir.exists():
         return []
     return sorted(p for p in content_dir.rglob("*.md") if p.is_file())
+
+
+def discover_marginalia(data_dir: Path) -> list[Path]:
+    """Walk data/marginalia/ and collect all .yaml files."""
+    marginalia_dir = data_dir / "marginalia"
+    if not marginalia_dir.exists():
+        return []
+    return sorted(p for p in marginalia_dir.rglob("*.yaml") if p.is_file())
 
 
 def classify_page(rel_path: str, filename: str) -> tuple[str, str, str | None]:
@@ -146,7 +157,8 @@ def index_content(
         force: If True, re-index all files regardless of sync state.
 
     Returns:
-        Stats dict: {indexed, unchanged, removed, errors}.
+        Stats dict with keys: indexed, unchanged, removed, errors,
+        marginalia_indexed, marginalia_unchanged, marginalia_removed.
     """
     hugo_root_path = Path(hugo_root)
     content_dir = hugo_root_path / "content"
@@ -161,7 +173,11 @@ def index_content(
     else:
         md_files = discover_content(content_dir)
 
-    stats = {"indexed": 0, "unchanged": 0, "removed": 0, "errors": []}
+    stats = {
+        "indexed": 0, "unchanged": 0, "removed": 0, "errors": [],
+        "marginalia_indexed": 0, "marginalia_unchanged": 0,
+        "marginalia_removed": 0,
+    }
 
     # Track which paths we've seen for cleanup
     seen_paths: set[str] = set()
@@ -215,5 +231,76 @@ def index_content(
             db.delete_page(path)
             db.delete_sync_state(path)
             stats["removed"] += 1
+
+    # ── Marginalia pass ─────────────────────────────────────────
+    data_dir = hugo_root_path / "data"
+    marginalia_files = discover_marginalia(data_dir)
+    seen_marginalia_sources: set[str] = set()
+
+    for yaml_file in marginalia_files:
+        rel_file = str(yaml_file.relative_to(hugo_root_path))
+        seen_marginalia_sources.add(rel_file)
+
+        try:
+            raw_bytes = yaml_file.read_bytes()
+            file_hash = _content_hash(raw_bytes)
+            file_mtime = yaml_file.stat().st_mtime
+
+            # Incremental check
+            if not force:
+                sync = db.get_sync_state(rel_file)
+                if sync and sync["content_hash"] == file_hash:
+                    if sync["file_mtime"] != file_mtime:
+                        db.save_sync_state(
+                            rel_file, file_hash, file_mtime, _now_iso()
+                        )
+                    stats["marginalia_unchanged"] += 1
+                    continue
+
+            # Parse YAML
+            notes = yaml.safe_load(raw_bytes.decode("utf-8"))
+            if not isinstance(notes, list):
+                notes = []
+
+            # Compute page_path from the marginalia file's relative path
+            marginalia_rel = str(
+                yaml_file.relative_to(data_dir / "marginalia")
+            )
+            page_path = page_path_for_marginalia(marginalia_rel)
+
+            # Clear old entries for this source file before re-inserting
+            db.delete_marginalia_by_source(rel_file)
+
+            notes_in_file = 0
+            for note in notes:
+                note_id = note.get("id")
+                body = note.get("body")
+                if not note_id or not body:
+                    continue
+                created_at = note.get("created", _now_iso())
+                db.save_marginalia({
+                    "id": note_id,
+                    "page_path": page_path,
+                    "body": body,
+                    "created_at": created_at,
+                    "source_file": rel_file,
+                })
+                notes_in_file += 1
+
+            # Update sync state
+            db.save_sync_state(rel_file, file_hash, file_mtime, _now_iso())
+            stats["marginalia_indexed"] += notes_in_file
+
+        except Exception as e:
+            stats["errors"].append({"path": rel_file, "error": str(e)})
+
+    # Cleanup: remove marginalia whose source_file no longer exists
+    if not paths:
+        known_sources = db.get_all_marginalia_source_files()
+        removed_sources = known_sources - seen_marginalia_sources
+        for source in removed_sources:
+            db.delete_marginalia_by_source(source)
+            db.delete_sync_state(source)
+            stats["marginalia_removed"] += 1
 
     return stats
