@@ -1,5 +1,6 @@
 """Integration tests: end-to-end pipeline through MCP tools."""
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from hugo_memex.db import Database
 from hugo_memex.indexer import index_content
 from hugo_memex.mcp import create_server
+from hugo_memex.writer import add_marginalia, delete_marginalia_from_disk
 
 
 @pytest.fixture
@@ -230,3 +232,68 @@ class TestRealSiteIntegration:
         if active_projects:
             content = get_content(path=active_projects[0]["path"])
             assert len(content) > 0
+
+
+class TestMarginaliaLifecycle:
+    """Full lifecycle: index, add, re-index, delete, orphan survival, FTS."""
+
+    def test_full_lifecycle(self, fixtures_dir, tmp_path):
+        # 1. Copy fixtures to a writable tmp directory
+        site = tmp_path / "site"
+        shutil.copytree(fixtures_dir, site)
+
+        # 2. Create in-memory DB
+        db = Database(":memory:")
+
+        # 3. Initial index: fixture marginalia should be picked up
+        stats = index_content(str(site), db)
+        assert stats["marginalia_indexed"] >= 2
+        assert stats["errors"] == []
+
+        # 4. Query fixture marginalia for the test post
+        notes = db.get_marginalia("post/test-post/index.md")
+        assert len(notes) >= 2
+        original_count = len(notes)
+
+        # 5. Add a new note via the writer
+        result = add_marginalia(
+            str(site), "post/test-post/index.md", "New lifecycle note",
+        )
+        assert result["status"] == "created"
+        assert result["id"].startswith("mg-")
+
+        # 6. Re-index: the changed YAML file should be re-indexed
+        stats2 = index_content(str(site), db)
+        assert stats2["marginalia_indexed"] >= 1
+
+        # 7. Query again: count should be original + 1, new note present
+        notes_after_add = db.get_marginalia("post/test-post/index.md")
+        assert len(notes_after_add) == original_count + 1
+        bodies = [n["body"] for n in notes_after_add]
+        assert "New lifecycle note" in bodies
+
+        # 8. Delete the new note from disk
+        delete_result = delete_marginalia_from_disk(
+            str(site), result["source_file"], result["id"],
+        )
+        assert delete_result["status"] == "deleted"
+
+        # 9. Re-index: count should return to original
+        stats3 = index_content(str(site), db)
+        notes_after_delete = db.get_marginalia("post/test-post/index.md")
+        assert len(notes_after_delete) == original_count
+
+        # 10. Orphan survival: deleting the page should NOT delete marginalia
+        db.delete_page("post/test-post/index.md")
+        orphan_notes = db.get_marginalia("post/test-post/index.md")
+        assert len(orphan_notes) == original_count
+
+        # 11. FTS still works: MATCH 'Python' on marginalia_fts returns results
+        fts_hits = db.execute_sql(
+            "SELECT id, body FROM marginalia_fts "
+            "WHERE marginalia_fts MATCH 'Python'"
+        )
+        assert len(fts_hits) >= 1
+
+        # 12. Close DB
+        db.close()
