@@ -143,7 +143,7 @@ Common queries:
 
 List recent posts:
   SELECT path, title, date, section FROM pages
-  WHERE kind = 'page' AND draft = 0
+  WHERE kind = 'page' AND draft = 0 AND archived_at IS NULL
   ORDER BY date DESC LIMIT 20
 
 Full-text search:
@@ -155,7 +155,7 @@ Full-text search:
 Pages by tag:
   SELECT p.path, p.title, p.date FROM pages p
   JOIN taxonomies t ON p.path = t.page_path
-  WHERE t.taxonomy = 'tags' AND t.term = 'python'
+  WHERE t.taxonomy = 'tags' AND t.term = 'python' AND p.archived_at IS NULL
 
 Tag cloud:
   SELECT term, COUNT(*) as count FROM taxonomies

@@ -64,6 +64,7 @@ Hugo content/ + data/marginalia/  <-- loop back to top via rebuild_index
 - **pages_fts**: FTS5 virtual table over `(title, description, body)`. Joined to `pages` via `path`.
 - **marginalia**: Free-form notes attached to pages. No FK to `pages` (orphan survival). Source YAML files live in `data/marginalia/`.
 - **marginalia_fts**: FTS5 virtual table over marginalia body text.
+- **Soft delete**: `pages.archived_at` and `marginalia.archived_at` are `NULL` for active records; any ISO timestamp means archived. Default MCP reads and query examples filter `archived_at IS NULL`.
 
 ### Security model
 
@@ -79,6 +80,7 @@ Hugo content/ + data/marginalia/  <-- loop back to top via rebuild_index
 - FTS5 with porter stemming + unicode61 tokenizer
 - Two-phase writes: write file to disk, then `rebuild_index(paths=[...])` to update the index
 - Marginalia stored in `data/marginalia/` as YAML files, mirroring content path structure
+- Missing source files archive rather than delete. Hard delete is CLI-only via `hugo-memex purge --missing` or `--archived-before`.
 
 ## Testing patterns
 

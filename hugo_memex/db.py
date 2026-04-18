@@ -271,7 +271,33 @@ class Database:
 --
 -- Orphaned marginalia (page deleted but notes survive):
 --   SELECT id, page_path, body FROM marginalia
---   WHERE page_path NOT IN (SELECT path FROM pages)"""
+--   WHERE page_path NOT IN (SELECT path FROM pages)
+
+-- == Archived Records (soft delete) ==========================================
+-- All record tables use soft delete: archived_at IS NULL means active.
+-- Default queries should filter archived rows unless you want history.
+--
+-- Active pages only:
+--   SELECT path, title FROM pages
+--   WHERE archived_at IS NULL AND draft = 0
+--   ORDER BY date DESC
+--
+-- Recently archived pages (last 30 days):
+--   SELECT path, archived_at FROM pages
+--   WHERE archived_at IS NOT NULL
+--     AND date(archived_at) > date('now', '-30 days')
+--   ORDER BY archived_at DESC
+--
+-- Archived marginalia for a page (history view):
+--   SELECT id, body, created_at, archived_at FROM marginalia
+--   WHERE page_path = ? AND archived_at IS NOT NULL
+--   ORDER BY archived_at DESC
+--
+-- Count active vs archived per section:
+--   SELECT section,
+--          SUM(CASE WHEN archived_at IS NULL THEN 1 ELSE 0 END) as active,
+--          SUM(CASE WHEN archived_at IS NOT NULL THEN 1 ELSE 0 END) as archived
+--   FROM pages GROUP BY section ORDER BY section"""
         return ddl + docs
 
     # ── Statistics ───────────────────────────────────────────────
