@@ -603,6 +603,41 @@ class Database:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    # ── Purge helpers (used by CLI purge command) ───────────────
+
+    def find_all_archived_pages(self) -> list[str]:
+        """Return paths of all archived pages."""
+        rows = self.execute_sql(
+            "SELECT path FROM pages WHERE archived_at IS NOT NULL ORDER BY path"
+        )
+        return [r["path"] for r in rows]
+
+    def find_archived_pages_before(self, cutoff: str) -> list[str]:
+        """Return paths of pages archived before a given ISO timestamp."""
+        rows = self.execute_sql(
+            "SELECT path FROM pages "
+            "WHERE archived_at IS NOT NULL AND archived_at < ? "
+            "ORDER BY path",
+            (cutoff,),
+        )
+        return [r["path"] for r in rows]
+
+    def find_all_archived_marginalia(self) -> list[dict]:
+        """Return id + source_file for all archived marginalia notes."""
+        return self.execute_sql(
+            "SELECT id, source_file FROM marginalia "
+            "WHERE archived_at IS NOT NULL ORDER BY id"
+        )
+
+    def find_archived_marginalia_before(self, cutoff: str) -> list[dict]:
+        """Return id + source_file for marginalia archived before cutoff."""
+        return self.execute_sql(
+            "SELECT id, source_file FROM marginalia "
+            "WHERE archived_at IS NOT NULL AND archived_at < ? "
+            "ORDER BY id",
+            (cutoff,),
+        )
+
 
 def _migrate_v1_to_v2(conn):
     """Add marginalia tables."""

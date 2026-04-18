@@ -639,6 +639,91 @@ class TestGetMarginaliaFiltering:
         assert ids == {"mg-active", "mg-arch"}
 
 
+# ── Task 3: Purge helpers ──────────────────────────────────────
+
+
+class TestPurgeMethods:
+    def test_find_archived_pages_before(self, db):
+        db.conn.execute(
+            "INSERT INTO pages (path, title, section, kind, front_matter, content_hash, indexed_at, archived_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("post/old/index.md", "Old", "post", "page", "{}", "h", "2026-01-01T00:00:00Z", "2026-01-15T00:00:00Z"),
+        )
+        db.conn.execute(
+            "INSERT INTO pages (path, title, section, kind, front_matter, content_hash, indexed_at, archived_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("post/recent/index.md", "Recent", "post", "page", "{}", "h", "2026-01-01T00:00:00Z", "2026-04-10T00:00:00Z"),
+        )
+        db.conn.execute(
+            "INSERT INTO pages (path, title, section, kind, front_matter, content_hash, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("post/active/index.md", "Active", "post", "page", "{}", "h", "2026-01-01T00:00:00Z"),
+        )
+        db.conn.commit()
+        paths = db.find_archived_pages_before("2026-03-01T00:00:00Z")
+        assert paths == ["post/old/index.md"]
+
+    def test_find_archived_marginalia_before(self, db):
+        db.save_marginalia({
+            "id": "mg-old", "page_path": "p", "body": "b",
+            "created_at": "2026-01-01T00:00:00Z", "source_file": "f",
+            "archived_at": "2026-01-15T00:00:00Z",
+        })
+        db.save_marginalia({
+            "id": "mg-recent", "page_path": "p", "body": "b",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "f",
+            "archived_at": "2026-04-10T00:00:00Z",
+        })
+        db.save_marginalia({
+            "id": "mg-active", "page_path": "p", "body": "b",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "f",
+        })
+        results = db.find_archived_marginalia_before("2026-03-01T00:00:00Z")
+        assert len(results) == 1
+        assert results[0]["id"] == "mg-old"
+        assert results[0]["source_file"] == "f"
+
+    def test_find_all_archived_pages(self, db):
+        db.conn.execute(
+            "INSERT INTO pages (path, title, section, kind, front_matter, content_hash, indexed_at, archived_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("post/a/index.md", "A", "post", "page", "{}", "h", "2026-01-01T00:00:00Z", "2026-04-10T00:00:00Z"),
+        )
+        db.conn.execute(
+            "INSERT INTO pages (path, title, section, kind, front_matter, content_hash, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("post/b/index.md", "B", "post", "page", "{}", "h", "2026-01-01T00:00:00Z"),
+        )
+        db.conn.commit()
+        paths = db.find_all_archived_pages()
+        assert paths == ["post/a/index.md"]
+
+    def test_find_all_archived_marginalia(self, db):
+        db.save_marginalia({
+            "id": "mg-a", "page_path": "p", "body": "b",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "f1",
+            "archived_at": "2026-04-10T00:00:00Z",
+        })
+        db.save_marginalia({
+            "id": "mg-b", "page_path": "p", "body": "b",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "f2",
+        })
+        results = db.find_all_archived_marginalia()
+        ids = [r["id"] for r in results]
+        assert ids == ["mg-a"]
+
+    def test_delete_page_hard(self, db):
+        db.conn.execute(
+            "INSERT INTO pages (path, title, section, kind, front_matter, content_hash, indexed_at, archived_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("post/x/index.md", "X", "post", "page", "{}", "h", "2026-01-01T00:00:00Z", "2026-04-10T00:00:00Z"),
+        )
+        db.conn.commit()
+        assert db.delete_page("post/x/index.md") is True
+        rows = db.execute_sql("SELECT 1 FROM pages WHERE path = ?", ("post/x/index.md",))
+        assert rows == []
+
+
 class TestMigrationV2ToV3:
     def test_v2_db_migrates_to_v3(self, tmp_path):
         """A v2 database on disk upgrades to v3 when opened, preserving data."""
