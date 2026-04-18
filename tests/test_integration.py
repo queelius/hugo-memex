@@ -8,7 +8,12 @@ import pytest
 from hugo_memex.db import Database
 from hugo_memex.indexer import index_content
 from hugo_memex.mcp import create_server
-from hugo_memex.writer import add_marginalia, purge_marginalia_from_disk
+from hugo_memex.writer import (
+    add_marginalia,
+    archive_marginalia_on_disk,
+    purge_marginalia_from_disk,
+    restore_marginalia_on_disk,
+)
 
 
 @pytest.fixture
@@ -296,4 +301,62 @@ class TestMarginaliaLifecycle:
         assert len(fts_hits) >= 1
 
         # 12. Close DB
+        db.close()
+
+
+class TestSoftDeleteLifecycle:
+    def test_full_lifecycle(self, tmp_path, fixtures_dir):
+        """End-to-end: add, archive (via writer), hidden by default, restore, purge."""
+        import shutil
+
+        site = tmp_path / "site"
+        shutil.copytree(fixtures_dir, site)
+        db = Database(":memory:")
+        index_content(str(site), db)
+
+        # Phase 1: Add a note, verify it's active
+        r = add_marginalia(str(site), "post/test-post/index.md", "lifecycle-test-note")
+        index_content(str(site), db)
+        rows = db.get_marginalia("post/test-post/index.md")
+        assert any(n["id"] == r["id"] for n in rows)
+
+        # Phase 2: Archive via writer, verify hidden in default get, visible with include_archived
+        archive_marginalia_on_disk(
+            str(site), r["source_file"], r["id"], "2026-04-18T12:00:00Z",
+        )
+        index_content(str(site), db)
+        active = db.get_marginalia("post/test-post/index.md")
+        assert not any(n["id"] == r["id"] for n in active)
+        all_notes = db.get_marginalia("post/test-post/index.md", include_archived=True)
+        assert any(n["id"] == r["id"] for n in all_notes)
+
+        # Phase 3: Restore, verify active again
+        restore_marginalia_on_disk(str(site), r["source_file"], r["id"])
+        index_content(str(site), db, force=True)
+        active = db.get_marginalia("post/test-post/index.md")
+        assert any(n["id"] == r["id"] for n in active)
+
+        # Phase 4: Archive by removing the source .md file (page-level archive)
+        md = site / "content" / "post" / "test-post" / "index.md"
+        md.unlink()
+        md.parent.rmdir()
+        stats = index_content(str(site), db)
+        assert stats["archived"] == 1
+        rows = db.execute_sql(
+            "SELECT archived_at FROM pages WHERE path = ?",
+            ("post/test-post/index.md",),
+        )
+        assert rows[0]["archived_at"] is not None
+
+        # Phase 5: Purge the archived note via writer, verify gone
+        archive_marginalia_on_disk(
+            str(site), r["source_file"], r["id"], "2026-04-18T13:00:00Z",
+        )
+        purge_marginalia_from_disk(str(site), r["source_file"], r["id"])
+        db.delete_marginalia(r["id"])
+        rows = db.execute_sql(
+            "SELECT 1 FROM marginalia WHERE id = ?", (r["id"],)
+        )
+        assert rows == []
+
         db.close()
