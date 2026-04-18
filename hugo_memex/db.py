@@ -545,18 +545,35 @@ class Database:
 
     # ── Archive / Restore ───────────────────────────────────────
 
+    def _run_write(self, sql: str, params: tuple):
+        """Execute a write statement, temporarily lifting the readonly authorizer
+        if necessary. The authorizer blocks raw SQL writes via execute_sql
+        (guarding against SQL injection), but direct Python API methods on the
+        Database object are expected to work regardless.
+        """
+        if self.readonly:
+            self.conn.set_authorizer(None)
+            try:
+                cursor = self.conn.execute(sql, params)
+                self.conn.commit()
+                return cursor
+            finally:
+                self.conn.set_authorizer(_readonly_authorizer)
+        cursor = self.conn.execute(sql, params)
+        self.conn.commit()
+        return cursor
+
     def archive_page(self, path: str, timestamp: str) -> bool:
         """Mark a page archived. Idempotent: does not overwrite existing archived_at.
 
         Returns True if the page exists (whether it was newly archived or already
         archived), False if the page does not exist.
         """
-        cursor = self.conn.execute(
+        cursor = self._run_write(
             "UPDATE pages SET archived_at = ? "
             "WHERE path = ? AND archived_at IS NULL",
             (timestamp, path),
         )
-        self.conn.commit()
         if cursor.rowcount > 0:
             return True
         exists = self.execute_sql(
@@ -566,22 +583,20 @@ class Database:
 
     def restore_page(self, path: str) -> bool:
         """Clear archived_at on a page. Returns True if a row was updated."""
-        cursor = self.conn.execute(
+        cursor = self._run_write(
             "UPDATE pages SET archived_at = NULL "
             "WHERE path = ? AND archived_at IS NOT NULL",
             (path,),
         )
-        self.conn.commit()
         return cursor.rowcount > 0
 
     def archive_marginalia(self, note_id: str, timestamp: str) -> bool:
         """Mark a marginalia note archived. Idempotent."""
-        cursor = self.conn.execute(
+        cursor = self._run_write(
             "UPDATE marginalia SET archived_at = ? "
             "WHERE id = ? AND archived_at IS NULL",
             (timestamp, note_id),
         )
-        self.conn.commit()
         if cursor.rowcount > 0:
             return True
         exists = self.execute_sql(
@@ -595,12 +610,11 @@ class Database:
         Named `restore_marginalia_row` (not `restore_marginalia`) to avoid confusion
         with the MCP-level restore_marginalia tool, which also edits the YAML file.
         """
-        cursor = self.conn.execute(
+        cursor = self._run_write(
             "UPDATE marginalia SET archived_at = NULL "
             "WHERE id = ? AND archived_at IS NOT NULL",
             (note_id,),
         )
-        self.conn.commit()
         return cursor.rowcount > 0
 
     # ── Purge helpers (used by CLI purge command) ───────────────

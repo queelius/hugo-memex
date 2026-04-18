@@ -95,6 +95,35 @@ def _get_config(mcp, ctx=None):
     return getattr(mcp, "_live_config", None) or getattr(mcp, "_test_config", {})
 
 
+class _WriteSession:
+    """Context manager that yields a writable Database for the given read-only db.
+
+    For :memory: databases (used in tests), lifts the authorizer on the shared
+    connection and restores it on exit. For file-backed databases, opens a
+    separate read-write connection and closes it on exit. This mirrors the
+    pattern used by rebuild_index.
+    """
+
+    def __init__(self, db):
+        self._base = db
+        self._owned = None
+
+    def __enter__(self):
+        if self._base.db_path == ":memory:":
+            self._base.conn.set_authorizer(None)
+            return self._base
+        self._owned = Database(self._base.db_path)
+        return self._owned
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._owned is not None:
+            self._owned.close()
+        else:
+            from hugo_memex.db import _readonly_authorizer
+            self._base.conn.set_authorizer(_readonly_authorizer)
+        return False
+
+
 def _register_tools(mcp: FastMCP):
     """Register all MCP tools."""
 
@@ -222,6 +251,10 @@ The path should be relative to the content/ directory.
             bool,
             Field(description="Include draft pages (default false)"),
         ] = False,
+        include_archived: Annotated[
+            bool,
+            Field(description="Include archived pages (default false)"),
+        ] = False,
         limit: Annotated[
             int,
             Field(description="Max pages to return (default 20)"),
@@ -260,6 +293,9 @@ Examples:
 
         if not include_drafts:
             conds.append("p.draft = 0")
+
+        if not include_archived:
+            conds.append("p.archived_at IS NULL")
 
         # Shared column list; join with FTS only when searching
         columns = (
@@ -359,19 +395,8 @@ Pass specific paths to re-index only those files.
         # Use a separate read-write connection for indexing to avoid
         # disabling the authorizer on the shared read-only connection.
         # For :memory: DBs (tests), we must reuse the same connection.
-        if database.db_path == ":memory:":
-            database.conn.set_authorizer(None)
-            try:
-                return index_content(hugo_root, database, paths=paths, force=force)
-            finally:
-                from hugo_memex.db import _readonly_authorizer
-                database.conn.set_authorizer(_readonly_authorizer)
-        else:
-            write_db = Database(database.db_path)
-            try:
-                return index_content(hugo_root, write_db, paths=paths, force=force)
-            finally:
-                write_db.close()
+        with _WriteSession(database) as write_db:
+            return index_content(hugo_root, write_db, paths=paths, force=force)
 
 
     # ── Writing tools ──────────────────────────────────────────
@@ -502,15 +527,23 @@ related_posts), and GPG body hash match.
 
     @mcp.tool(annotations={"readOnlyHint": True})
     def get_marginalia(
-        page_path: Annotated[str, Field(description="Content path relative to content/ (e.g. 'post/my-post/index.md')")],
+        page_path: Annotated[
+            str,
+            Field(description="Content path relative to content/"),
+        ],
+        include_archived: Annotated[
+            bool,
+            Field(description="If True, include archived notes. Default False returns only active notes."),
+        ] = False,
         ctx: Context | None = None,
     ) -> list[dict]:
         """Get all marginalia notes for a page.
 
-Returns notes ordered by creation time. Each note has id, body, created_at,
-page_path, and source_file fields.
+By default excludes archived notes. Pass include_archived=True to see the
+full history, including soft-deleted notes.
 """
-        return _get_db(mcp, ctx).get_marginalia(page_path)
+        database = _get_db(mcp, ctx)
+        return database.get_marginalia(page_path, include_archived=include_archived)
 
     @mcp.tool()
     def add_marginalia(
@@ -520,8 +553,9 @@ page_path, and source_file fields.
     ) -> dict:
         """Add a marginalia note to a content page.
 
-Creates (or appends to) a YAML file under data/marginalia/.
-Call rebuild_index() after to update the search index.
+Creates (or appends to) a YAML file under data/marginalia/ and synchronously
+indexes the new note in the database. No rebuild_index call is required for
+subsequent get_marginalia/delete_marginalia/restore_marginalia to see it.
 """
         config = _get_config(mcp, ctx)
         hugo_root = config.get("hugo_root")
@@ -531,38 +565,119 @@ Call rebuild_index() after to update the search index.
         from hugo_memex.writer import add_marginalia as _add
 
         try:
-            return _add(hugo_root, page_path, body)
+            result = _add(hugo_root, page_path, body)
         except (ValueError, FileNotFoundError) as e:
             raise ToolError(str(e))
 
+        # Synchronously index the new note so callers don't have to run
+        # rebuild_index before querying, deleting, or restoring it.
+        database = _get_db(mcp, ctx)
+        from datetime import datetime, timezone
+        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with _WriteSession(database) as write_db:
+            write_db.save_marginalia({
+                "id": result["id"],
+                "page_path": page_path,
+                "body": body,
+                "created_at": created_at,
+                "source_file": result["source_file"],
+                "archived_at": None,
+            })
+        return result
+
     @mcp.tool()
     def delete_marginalia(
-        id: Annotated[str, Field(description="Marginalia note ID (e.g. 'mg-abc123def456')")],
+        id: Annotated[
+            str,
+            Field(description="Marginalia note ID (e.g. 'mg-abc123def456')"),
+        ],
+        purge: Annotated[
+            bool,
+            Field(description="If True, hard-delete the note (remove from YAML and DB). Default False archives the note instead."),
+        ] = False,
         ctx: Context | None = None,
     ) -> dict:
-        """Delete a marginalia note by ID.
+        """Delete a marginalia note.
 
-Removes the note from its YAML file on disk. If the file becomes empty,
-the file itself is removed. Call rebuild_index() after to update the index.
+Default behavior is soft delete (archive): adds archived_at to the YAML entry
+and updates the DB row. The note is still on disk and still indexed but hidden
+from default get_marginalia calls.
+
+With purge=True, removes the note entirely from YAML and DB. The DB row and
+FTS entry are hard-deleted. Use with caution: this breaks URI stability.
 """
         config = _get_config(mcp, ctx)
         hugo_root = config.get("hugo_root")
         if not hugo_root:
             raise ToolError("hugo_root not configured")
-
         database = _get_db(mcp, ctx)
         rows = database.execute_sql(
-            "SELECT source_file FROM marginalia WHERE id = ?", (id,)
+            "SELECT source_file, archived_at FROM marginalia WHERE id = ?",
+            (id,),
         )
         if not rows:
             raise ToolError(f"Marginalia note not found: {id}")
+        source_file = rows[0]["source_file"]
 
-        from hugo_memex.writer import delete_marginalia_from_disk
+        if purge:
+            from hugo_memex.writer import purge_marginalia_from_disk
+            try:
+                purge_marginalia_from_disk(hugo_root, source_file, id)
+            except (ValueError, FileNotFoundError) as e:
+                raise ToolError(str(e))
+            with _WriteSession(database) as write_db:
+                write_db.delete_marginalia(id)
+            return {"id": id, "status": "purged"}
 
+        if rows[0]["archived_at"] is not None:
+            return {"id": id, "status": "already_archived"}
+        from hugo_memex.writer import archive_marginalia_on_disk
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
-            return delete_marginalia_from_disk(hugo_root, rows[0]["source_file"], id)
+            archive_marginalia_on_disk(hugo_root, source_file, id, now_iso)
         except (ValueError, FileNotFoundError) as e:
             raise ToolError(str(e))
+        with _WriteSession(database) as write_db:
+            write_db.archive_marginalia(id, now_iso)
+        return {"id": id, "status": "archived", "archived_at": now_iso}
+
+    @mcp.tool()
+    def restore_marginalia(
+        id: Annotated[
+            str,
+            Field(description="Marginalia note ID to restore (e.g. 'mg-abc123def456')"),
+        ],
+        ctx: Context | None = None,
+    ) -> dict:
+        """Restore an archived marginalia note.
+
+Removes the archived_at field from the YAML entry and clears the DB row's
+archived_at synchronously. No-op (returns already_active) if the note is
+not currently archived.
+"""
+        config = _get_config(mcp, ctx)
+        hugo_root = config.get("hugo_root")
+        if not hugo_root:
+            raise ToolError("hugo_root not configured")
+        database = _get_db(mcp, ctx)
+        rows = database.execute_sql(
+            "SELECT source_file, archived_at FROM marginalia WHERE id = ?",
+            (id,),
+        )
+        if not rows:
+            raise ToolError(f"Marginalia note not found: {id}")
+        if rows[0]["archived_at"] is None:
+            return {"id": id, "status": "already_active"}
+        source_file = rows[0]["source_file"]
+        from hugo_memex.writer import restore_marginalia_on_disk
+        try:
+            restore_marginalia_on_disk(hugo_root, source_file, id)
+        except (ValueError, FileNotFoundError) as e:
+            raise ToolError(str(e))
+        with _WriteSession(database) as write_db:
+            write_db.restore_marginalia_row(id)
+        return {"id": id, "status": "restored"}
 
 
 def _register_resources(mcp: FastMCP):

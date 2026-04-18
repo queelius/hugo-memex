@@ -410,23 +410,154 @@ class TestAddMarginalia:
 
 class TestDeleteMarginalia:
     @pytest.mark.asyncio
-    async def test_delete_marginalia(self, writable_mcp_server):
-        server, site = writable_mcp_server
-        # First add a note so we have something to delete
-        add_fn = await _get_tool_fn(server, "add_marginalia")
-        added = add_fn(page_path="post/test-post/index.md", body="Note to delete")
-        note_id = added["id"]
-        # Re-index so the DB knows about the new note
-        rebuild_fn = await _get_tool_fn(server, "rebuild_index")
-        rebuild_fn(force=True)
-        # Now delete it
-        del_fn = await _get_tool_fn(server, "delete_marginalia")
-        result = del_fn(id=note_id)
-        assert result["status"] == "deleted"
-
-    @pytest.mark.asyncio
     async def test_delete_marginalia_not_found(self, writable_mcp_server):
         server, site = writable_mcp_server
         fn = await _get_tool_fn(server, "delete_marginalia")
         with pytest.raises(Exception):
             fn(id="mg-nonexistent")
+
+
+class TestDeleteMarginaliaSoftDefault:
+    @pytest.mark.asyncio
+    async def test_delete_default_archives(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        add_fn = await _get_tool_fn(server, "add_marginalia")
+        r = add_fn(page_path="post/test-post/index.md", body="to archive via MCP")
+        del_fn = await _get_tool_fn(server, "delete_marginalia")
+        result = del_fn(id=r["id"])
+        assert result["status"] == "archived"
+        import yaml as _yaml
+        notes = _yaml.safe_load(
+            (site / r["source_file"]).read_text()
+        )
+        target = next(n for n in notes if n["id"] == r["id"])
+        assert "archived_at" in target
+        db = server._test_db
+        rows = db.execute_sql(
+            "SELECT archived_at FROM marginalia WHERE id = ?", (r["id"],)
+        )
+        assert rows[0]["archived_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_delete_with_purge_removes(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        add_fn = await _get_tool_fn(server, "add_marginalia")
+        r = add_fn(page_path="post/test-post/index.md", body="to purge via MCP")
+        del_fn = await _get_tool_fn(server, "delete_marginalia")
+        result = del_fn(id=r["id"], purge=True)
+        assert result["status"] == "purged"
+        import yaml as _yaml
+        notes = _yaml.safe_load(
+            (site / r["source_file"]).read_text()
+        )
+        ids = [n["id"] for n in notes]
+        assert r["id"] not in ids
+        db = server._test_db
+        rows = db.execute_sql(
+            "SELECT 1 FROM marginalia WHERE id = ?", (r["id"],)
+        )
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_delete_already_archived_is_noop(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        add_fn = await _get_tool_fn(server, "add_marginalia")
+        r = add_fn(page_path="post/test-post/index.md", body="noop delete")
+        del_fn = await _get_tool_fn(server, "delete_marginalia")
+        del_fn(id=r["id"])
+        result = del_fn(id=r["id"])
+        assert result["status"] == "already_archived"
+
+
+class TestRestoreMarginaliaTool:
+    @pytest.mark.asyncio
+    async def test_restore_archived_note(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        add_fn = await _get_tool_fn(server, "add_marginalia")
+        r = add_fn(page_path="post/test-post/index.md", body="restore me")
+        del_fn = await _get_tool_fn(server, "delete_marginalia")
+        del_fn(id=r["id"])
+        restore_fn = await _get_tool_fn(server, "restore_marginalia")
+        result = restore_fn(id=r["id"])
+        assert result["status"] == "restored"
+        db = server._test_db
+        rows = db.execute_sql(
+            "SELECT archived_at FROM marginalia WHERE id = ?", (r["id"],)
+        )
+        assert rows[0]["archived_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_restore_already_active_is_noop(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        add_fn = await _get_tool_fn(server, "add_marginalia")
+        r = add_fn(page_path="post/test-post/index.md", body="active")
+        restore_fn = await _get_tool_fn(server, "restore_marginalia")
+        result = restore_fn(id=r["id"])
+        assert result["status"] == "already_active"
+
+    @pytest.mark.asyncio
+    async def test_restore_nonexistent_raises(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        restore_fn = await _get_tool_fn(server, "restore_marginalia")
+        with pytest.raises(Exception):
+            restore_fn(id="mg-nonexistent")
+
+
+class TestGetMarginaliaIncludeArchived:
+    @pytest.mark.asyncio
+    async def test_default_excludes_archived(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        add_fn = await _get_tool_fn(server, "add_marginalia")
+        r_active = add_fn(page_path="post/test-post/index.md", body="active")
+        r_archived = add_fn(page_path="post/test-post/index.md", body="will-archive")
+        del_fn = await _get_tool_fn(server, "delete_marginalia")
+        del_fn(id=r_archived["id"])
+        get_fn = await _get_tool_fn(server, "get_marginalia")
+        result = get_fn(page_path="post/test-post/index.md")
+        ids = {r["id"] for r in result}
+        assert r_active["id"] in ids
+        assert r_archived["id"] not in ids
+
+    @pytest.mark.asyncio
+    async def test_include_archived_returns_all(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        add_fn = await _get_tool_fn(server, "add_marginalia")
+        r_active = add_fn(page_path="post/test-post/index.md", body="active")
+        r_archived = add_fn(page_path="post/test-post/index.md", body="will-archive-2")
+        del_fn = await _get_tool_fn(server, "delete_marginalia")
+        del_fn(id=r_archived["id"])
+        get_fn = await _get_tool_fn(server, "get_marginalia")
+        result = get_fn(page_path="post/test-post/index.md", include_archived=True)
+        ids = {r["id"] for r in result}
+        assert r_active["id"] in ids
+        assert r_archived["id"] in ids
+
+
+class TestGetPagesIncludeArchived:
+    @pytest.mark.asyncio
+    async def test_default_excludes_archived(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        db = server._test_db
+        db.archive_page("post/test-post/index.md", "2026-04-18T12:00:00Z")
+        get_fn = await _get_tool_fn(server, "get_pages")
+        result = get_fn(section="post")
+        paths = {p["path"] for p in result}
+        assert "post/test-post/index.md" not in paths
+
+    @pytest.mark.asyncio
+    async def test_include_archived(self, writable_mcp_server):
+        server, site = writable_mcp_server
+        db = server._test_db
+        db.archive_page("post/test-post/index.md", "2026-04-18T12:00:00Z")
+        get_fn = await _get_tool_fn(server, "get_pages")
+        result = get_fn(section="post", include_archived=True)
+        paths = {p["path"] for p in result}
+        assert "post/test-post/index.md" in paths
+
+
+class TestRestoreMarginaliaRegistered:
+    @pytest.mark.asyncio
+    async def test_restore_marginalia_registered(self, mcp_server):
+        tools = await mcp_server.get_tools()
+        tool_names = set(tools.keys()) if isinstance(tools, dict) else {t.name for t in tools}
+        assert "restore_marginalia" in tool_names
