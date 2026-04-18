@@ -305,18 +305,48 @@ class TestMarginaliaSchema:
 
 
 class TestMigrationV1ToV2:
+    # Hardcoded v1 schema snapshot — do NOT derive from current SCHEMA_SQL.
+    # Deriving from SCHEMA_SQL would cause new columns added to later migrations
+    # to appear in the v1 baseline, making ALTER TABLE statements in those
+    # migrations fail with "duplicate column name".
+    _V1_SCHEMA = """
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        CREATE TABLE pages (
+            path TEXT PRIMARY KEY, slug TEXT, title TEXT NOT NULL,
+            section TEXT NOT NULL, kind TEXT NOT NULL, bundle_type TEXT,
+            date TEXT, draft BOOLEAN NOT NULL DEFAULT 0, description TEXT,
+            word_count INTEGER, body TEXT, front_matter JSON NOT NULL DEFAULT '{}',
+            content_hash TEXT NOT NULL, indexed_at TEXT NOT NULL
+        );
+        CREATE TABLE taxonomies (
+            page_path TEXT NOT NULL REFERENCES pages(path) ON DELETE CASCADE,
+            taxonomy TEXT NOT NULL, term TEXT NOT NULL,
+            PRIMARY KEY (page_path, taxonomy, term)
+        );
+        CREATE VIRTUAL TABLE pages_fts USING fts5(
+            path UNINDEXED, title, description, body,
+            tokenize = 'porter unicode61'
+        );
+        CREATE TABLE sync_state (
+            file_path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+            file_mtime REAL NOT NULL, last_synced TEXT NOT NULL
+        );
+        CREATE INDEX idx_pages_section ON pages(section);
+        CREATE INDEX idx_pages_date ON pages(date);
+        CREATE INDEX idx_pages_draft ON pages(draft);
+        CREATE INDEX idx_pages_section_date ON pages(section, date DESC);
+        CREATE INDEX idx_taxonomies_term ON taxonomies(taxonomy, term);
+        CREATE INDEX idx_taxonomies_page ON taxonomies(page_path);
+    """
+
     def test_migration_creates_marginalia_tables(self, tmp_path):
-        """Create a v1 database, then reopen it to trigger migration to v2."""
+        """Create a v1 database, then reopen it to trigger migration to v2 and v3."""
+        import sqlite3
         db_path = str(tmp_path / "migrate.db")
-        # Create v1 schema manually: use a v1 database
-        conn = __import__("sqlite3").connect(db_path)
+        conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        # Create the v1 schema (pages, taxonomies, pages_fts, sync_state, schema_version)
-        from hugo_memex.db import SCHEMA_SQL
-        # Strip the marginalia parts for a v1-like schema
-        v1_sql = SCHEMA_SQL.split("CREATE TABLE IF NOT EXISTS marginalia")[0]
-        conn.executescript(v1_sql)
+        conn.executescript(self._V1_SCHEMA)
         conn.execute("INSERT INTO schema_version (version) VALUES (1)")
         conn.commit()
         # Verify no marginalia table yet
@@ -328,7 +358,7 @@ class TestMigrationV1ToV2:
         assert "marginalia" not in tables
         conn.close()
 
-        # Reopen via Database class — should trigger migration
+        # Reopen via Database class — should trigger v1→v2→v3 migration chain
         db = Database(db_path)
         tables = db.execute_sql(
             "SELECT name FROM sqlite_master WHERE type='table'"
@@ -337,9 +367,10 @@ class TestMigrationV1ToV2:
         assert "marginalia" in table_names
         assert "marginalia_fts" in table_names
 
-        # Schema version should be updated
+        # Migrations run all the way to current schema version
         rows = db.execute_sql("SELECT version FROM schema_version")
-        assert rows[0]["version"] == 2
+        from hugo_memex.db import SCHEMA_VERSION
+        assert rows[0]["version"] == SCHEMA_VERSION
         db.close()
 
 
@@ -450,3 +481,88 @@ class TestMarginaliaCRUD:
             "SELECT id FROM marginalia_fts WHERE marginalia_fts MATCH 'gamma'"
         )
         assert len(fts_rows) == 1
+
+
+# ── Task: Schema v3 (soft-delete: archived_at) ─────────────────
+
+
+class TestSchemaV3:
+    def test_pages_has_archived_at(self, db):
+        cols = {r["name"] for r in db.execute_sql("PRAGMA table_info(pages)")}
+        assert "archived_at" in cols
+
+    def test_marginalia_has_archived_at(self, db):
+        cols = {r["name"] for r in db.execute_sql("PRAGMA table_info(marginalia)")}
+        assert "archived_at" in cols
+
+    def test_archived_at_defaults_null(self, db):
+        db.conn.execute(
+            "INSERT INTO pages (path, title, section, kind, front_matter, content_hash, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("post/t/index.md", "T", "post", "page", "{}", "h", "2026-01-01T00:00:00Z"),
+        )
+        db.conn.commit()
+        rows = db.execute_sql("SELECT archived_at FROM pages WHERE path = ?", ("post/t/index.md",))
+        assert rows[0]["archived_at"] is None
+
+    def test_archived_at_indexes_exist(self, db):
+        indexes = {r["name"] for r in db.execute_sql(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        )}
+        assert "idx_pages_archived" in indexes
+        assert "idx_marginalia_archived" in indexes
+
+    def test_schema_version_is_3(self, db):
+        rows = db.execute_sql("SELECT version FROM schema_version")
+        assert rows[0]["version"] == 3
+
+
+class TestMigrationV2ToV3:
+    def test_v2_db_migrates_to_v3(self, tmp_path):
+        """A v2 database on disk upgrades to v3 when opened, preserving data."""
+        import sqlite3
+        db_path = tmp_path / "v2.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (2);
+            CREATE TABLE pages (
+                path TEXT PRIMARY KEY, slug TEXT, title TEXT NOT NULL,
+                section TEXT NOT NULL, kind TEXT NOT NULL, bundle_type TEXT,
+                date TEXT, draft BOOLEAN NOT NULL DEFAULT 0, description TEXT,
+                word_count INTEGER, body TEXT, front_matter JSON NOT NULL DEFAULT '{}',
+                content_hash TEXT NOT NULL, indexed_at TEXT NOT NULL
+            );
+            CREATE TABLE marginalia (
+                id TEXT PRIMARY KEY, page_path TEXT, body TEXT NOT NULL,
+                created_at TEXT NOT NULL, source_file TEXT NOT NULL
+            );
+            CREATE TABLE taxonomies (
+                page_path TEXT NOT NULL, taxonomy TEXT NOT NULL, term TEXT NOT NULL,
+                PRIMARY KEY (page_path, taxonomy, term)
+            );
+            CREATE TABLE sync_state (
+                file_path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+                file_mtime REAL NOT NULL, last_synced TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE pages_fts USING fts5(path UNINDEXED, title, description, body);
+            CREATE VIRTUAL TABLE marginalia_fts USING fts5(id UNINDEXED, body);
+            INSERT INTO pages (path, title, section, kind, front_matter, content_hash, indexed_at)
+            VALUES ('post/existing/index.md', 'Existing', 'post', 'page', '{}', 'h', '2026-01-01T00:00:00Z');
+        """)
+        conn.commit()
+        conn.close()
+
+        from hugo_memex.db import Database
+        db = Database(str(db_path))
+        try:
+            version = db.execute_sql("SELECT version FROM schema_version")[0]["version"]
+            assert version == 3
+            cols = {r["name"] for r in db.execute_sql("PRAGMA table_info(pages)")}
+            assert "archived_at" in cols
+            rows = db.execute_sql("SELECT path, archived_at FROM pages")
+            assert len(rows) == 1
+            assert rows[0]["path"] == "post/existing/index.md"
+            assert rows[0]["archived_at"] is None
+        finally:
+            db.close()

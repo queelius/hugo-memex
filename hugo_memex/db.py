@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Callable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS pages (
     body TEXT,
     front_matter JSON NOT NULL DEFAULT '{}',
     content_hash TEXT NOT NULL,
-    indexed_at TEXT NOT NULL
+    indexed_at TEXT NOT NULL,
+    archived_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS taxonomies (
@@ -64,11 +65,14 @@ CREATE TABLE IF NOT EXISTS marginalia (
     page_path TEXT,
     body TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    source_file TEXT NOT NULL
+    source_file TEXT NOT NULL,
+    archived_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_marginalia_page ON marginalia(page_path);
 CREATE INDEX IF NOT EXISTS idx_marginalia_source ON marginalia(source_file);
+CREATE INDEX IF NOT EXISTS idx_pages_archived ON pages(archived_at);
+CREATE INDEX IF NOT EXISTS idx_marginalia_archived ON marginalia(archived_at);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS marginalia_fts USING fts5(
     id UNINDEXED,
@@ -543,7 +547,18 @@ def _migrate_v1_to_v2(conn):
     """)
 
 
+def _migrate_v2_to_v3(conn):
+    """Add archived_at columns and indexes to pages and marginalia."""
+    conn.executescript("""
+        ALTER TABLE pages ADD COLUMN archived_at TEXT;
+        ALTER TABLE marginalia ADD COLUMN archived_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_pages_archived ON pages(archived_at);
+        CREATE INDEX IF NOT EXISTS idx_marginalia_archived ON marginalia(archived_at);
+    """)
+
+
 # Migration registry (version_from → migration_fn)
 _MIGRATIONS: dict[int, Callable] = {
     1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
 }
