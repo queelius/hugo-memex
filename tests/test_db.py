@@ -517,6 +517,128 @@ class TestSchemaV3:
         assert rows[0]["version"] == 3
 
 
+# ── Task 2: Archive/Restore DB methods ────────────────────────
+
+
+class TestArchiveRestoreMethods:
+    def _make_page(self, db, path="post/t/index.md"):
+        db.conn.execute(
+            "INSERT INTO pages (path, title, section, kind, front_matter, content_hash, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (path, "T", "post", "page", "{}", "h", "2026-01-01T00:00:00Z"),
+        )
+        db.conn.commit()
+
+    def test_archive_page_sets_timestamp(self, db):
+        self._make_page(db)
+        assert db.archive_page("post/t/index.md", "2026-04-18T12:00:00Z") is True
+        row = db.execute_sql("SELECT archived_at FROM pages WHERE path = ?", ("post/t/index.md",))[0]
+        assert row["archived_at"] == "2026-04-18T12:00:00Z"
+
+    def test_archive_page_missing_returns_false(self, db):
+        assert db.archive_page("post/missing/index.md", "2026-04-18T12:00:00Z") is False
+
+    def test_archive_page_idempotent(self, db):
+        """Archiving an already-archived page does not change archived_at."""
+        self._make_page(db)
+        db.archive_page("post/t/index.md", "2026-04-18T12:00:00Z")
+        db.archive_page("post/t/index.md", "2026-05-01T00:00:00Z")
+        row = db.execute_sql("SELECT archived_at FROM pages WHERE path = ?", ("post/t/index.md",))[0]
+        assert row["archived_at"] == "2026-04-18T12:00:00Z"
+
+    def test_restore_page_clears_timestamp(self, db):
+        self._make_page(db)
+        db.archive_page("post/t/index.md", "2026-04-18T12:00:00Z")
+        assert db.restore_page("post/t/index.md") is True
+        row = db.execute_sql("SELECT archived_at FROM pages WHERE path = ?", ("post/t/index.md",))[0]
+        assert row["archived_at"] is None
+
+    def test_restore_page_on_active_is_noop(self, db):
+        self._make_page(db)
+        assert db.restore_page("post/t/index.md") is False
+
+    def test_archive_marginalia(self, db):
+        db.save_marginalia({
+            "id": "mg-1", "page_path": "post/t/index.md", "body": "note",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "data/marginalia/post/t.yaml",
+        })
+        assert db.archive_marginalia("mg-1", "2026-04-18T12:00:00Z") is True
+        row = db.execute_sql("SELECT archived_at FROM marginalia WHERE id = ?", ("mg-1",))[0]
+        assert row["archived_at"] == "2026-04-18T12:00:00Z"
+
+    def test_archive_marginalia_missing(self, db):
+        assert db.archive_marginalia("mg-missing", "2026-04-18T12:00:00Z") is False
+
+    def test_archive_marginalia_idempotent(self, db):
+        db.save_marginalia({
+            "id": "mg-idem", "page_path": "p", "body": "b",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "f",
+        })
+        db.archive_marginalia("mg-idem", "2026-04-18T12:00:00Z")
+        db.archive_marginalia("mg-idem", "2026-05-01T00:00:00Z")
+        row = db.execute_sql("SELECT archived_at FROM marginalia WHERE id = ?", ("mg-idem",))[0]
+        assert row["archived_at"] == "2026-04-18T12:00:00Z"
+
+    def test_restore_marginalia(self, db):
+        db.save_marginalia({
+            "id": "mg-res", "page_path": "p", "body": "b",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "f",
+        })
+        db.archive_marginalia("mg-res", "2026-04-18T12:00:00Z")
+        assert db.restore_marginalia_row("mg-res") is True
+        row = db.execute_sql("SELECT archived_at FROM marginalia WHERE id = ?", ("mg-res",))[0]
+        assert row["archived_at"] is None
+
+
+class TestSaveMarginaliaPreservesArchivedAt:
+    def test_save_with_archived_at(self, db):
+        db.save_marginalia({
+            "id": "mg-a", "page_path": "p", "body": "b",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "f",
+            "archived_at": "2026-04-18T12:00:00Z",
+        })
+        row = db.execute_sql("SELECT archived_at FROM marginalia WHERE id = ?", ("mg-a",))[0]
+        assert row["archived_at"] == "2026-04-18T12:00:00Z"
+
+    def test_save_without_archived_at(self, db):
+        db.save_marginalia({
+            "id": "mg-b", "page_path": "p", "body": "b",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "f",
+        })
+        row = db.execute_sql("SELECT archived_at FROM marginalia WHERE id = ?", ("mg-b",))[0]
+        assert row["archived_at"] is None
+
+
+class TestGetMarginaliaFiltering:
+    def test_get_marginalia_excludes_archived_by_default(self, db):
+        db.save_marginalia({
+            "id": "mg-active", "page_path": "p", "body": "active",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "f",
+        })
+        db.save_marginalia({
+            "id": "mg-arch", "page_path": "p", "body": "archived",
+            "created_at": "2026-04-02T00:00:00Z", "source_file": "f",
+            "archived_at": "2026-04-18T12:00:00Z",
+        })
+        rows = db.get_marginalia("p")
+        ids = {r["id"] for r in rows}
+        assert ids == {"mg-active"}
+
+    def test_get_marginalia_include_archived(self, db):
+        db.save_marginalia({
+            "id": "mg-active", "page_path": "p", "body": "active",
+            "created_at": "2026-04-01T00:00:00Z", "source_file": "f",
+        })
+        db.save_marginalia({
+            "id": "mg-arch", "page_path": "p", "body": "archived",
+            "created_at": "2026-04-02T00:00:00Z", "source_file": "f",
+            "archived_at": "2026-04-18T12:00:00Z",
+        })
+        rows = db.get_marginalia("p", include_archived=True)
+        ids = {r["id"] for r in rows}
+        assert ids == {"mg-active", "mg-arch"}
+
+
 class TestMigrationV2ToV3:
     def test_v2_db_migrates_to_v3(self, tmp_path):
         """A v2 database on disk upgrades to v3 when opened, preserving data."""

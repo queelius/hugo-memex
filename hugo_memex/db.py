@@ -455,14 +455,18 @@ class Database:
     # ── Marginalia CRUD ─────────────────────────────────────────
 
     def save_marginalia(self, note: dict) -> None:
-        """Insert or replace a marginalia record and update FTS5."""
+        """Insert or replace a marginalia record and update FTS5.
+
+        Supports optional archived_at field in the note dict.
+        """
         self.conn.execute(
             "INSERT OR REPLACE INTO marginalia "
-            "(id, page_path, body, created_at, source_file) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "(id, page_path, body, created_at, source_file, archived_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 note["id"], note.get("page_path"), note["body"],
                 note["created_at"], note["source_file"],
+                note.get("archived_at"),
             ),
         )
         self.conn.execute(
@@ -474,11 +478,23 @@ class Database:
         )
         self.conn.commit()
 
-    def get_marginalia(self, page_path: str) -> list[dict]:
-        """Return all marginalia for a page, ordered by created_at."""
+    def get_marginalia(
+        self, page_path: str, include_archived: bool = False,
+    ) -> list[dict]:
+        """Return marginalia for a page, ordered by created_at.
+
+        By default excludes archived notes. Pass include_archived=True
+        to return all notes regardless of archive state.
+        """
+        if include_archived:
+            return self.execute_sql(
+                "SELECT * FROM marginalia WHERE page_path = ? "
+                "ORDER BY created_at",
+                (page_path,),
+            )
         return self.execute_sql(
             "SELECT * FROM marginalia WHERE page_path = ? "
-            "ORDER BY created_at",
+            "AND archived_at IS NULL ORDER BY created_at",
             (page_path,),
         )
 
@@ -525,6 +541,67 @@ class Database:
         except Exception:
             self.conn.rollback()
             raise
+
+
+    # ── Archive / Restore ───────────────────────────────────────
+
+    def archive_page(self, path: str, timestamp: str) -> bool:
+        """Mark a page archived. Idempotent: does not overwrite existing archived_at.
+
+        Returns True if the page exists (whether it was newly archived or already
+        archived), False if the page does not exist.
+        """
+        cursor = self.conn.execute(
+            "UPDATE pages SET archived_at = ? "
+            "WHERE path = ? AND archived_at IS NULL",
+            (timestamp, path),
+        )
+        self.conn.commit()
+        if cursor.rowcount > 0:
+            return True
+        exists = self.execute_sql(
+            "SELECT 1 FROM pages WHERE path = ?", (path,)
+        )
+        return bool(exists)
+
+    def restore_page(self, path: str) -> bool:
+        """Clear archived_at on a page. Returns True if a row was updated."""
+        cursor = self.conn.execute(
+            "UPDATE pages SET archived_at = NULL "
+            "WHERE path = ? AND archived_at IS NOT NULL",
+            (path,),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def archive_marginalia(self, note_id: str, timestamp: str) -> bool:
+        """Mark a marginalia note archived. Idempotent."""
+        cursor = self.conn.execute(
+            "UPDATE marginalia SET archived_at = ? "
+            "WHERE id = ? AND archived_at IS NULL",
+            (timestamp, note_id),
+        )
+        self.conn.commit()
+        if cursor.rowcount > 0:
+            return True
+        exists = self.execute_sql(
+            "SELECT 1 FROM marginalia WHERE id = ?", (note_id,)
+        )
+        return bool(exists)
+
+    def restore_marginalia_row(self, note_id: str) -> bool:
+        """Clear archived_at on a marginalia note. Returns True if a row was updated.
+
+        Named `restore_marginalia_row` (not `restore_marginalia`) to avoid confusion
+        with the MCP-level restore_marginalia tool, which also edits the YAML file.
+        """
+        cursor = self.conn.execute(
+            "UPDATE marginalia SET archived_at = NULL "
+            "WHERE id = ? AND archived_at IS NOT NULL",
+            (note_id,),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
 
 
 def _migrate_v1_to_v2(conn):
