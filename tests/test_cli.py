@@ -146,3 +146,119 @@ class TestCLISQL:
         _run_cli("index", env=env)
         result = _run_cli("sql", "DELETE FROM pages", env=env)
         assert result.returncode != 0
+
+
+class TestPurgeCLI:
+    def _setup_site(self, tmp_path, fixtures_dir, config_path):
+        import shutil
+        site = tmp_path / "site"
+        shutil.copytree(fixtures_dir, site)
+        db_path = tmp_path / "hugo.db"
+        config_path.write_text(
+            f"hugo_root: {site}\ndatabase_path: {db_path}\n"
+        )
+        return site, db_path
+
+    def _run_cli(self, config_path, *args):
+        return subprocess.run(
+            [sys.executable, "-m", "hugo_memex", "--config", str(config_path)]
+            + list(args),
+            capture_output=True,
+            text=True,
+        )
+
+    def test_purge_requires_filter(self, tmp_path, fixtures_dir):
+        config_path = tmp_path / "config.yaml"
+        self._setup_site(tmp_path, fixtures_dir, config_path)
+        result = self._run_cli(config_path, "purge")
+        assert result.returncode != 0
+        combined = (result.stderr + result.stdout).lower()
+        assert "filter" in combined or "missing" in combined
+
+    def test_purge_missing_purges_archived_missing_pages(self, tmp_path, fixtures_dir):
+        config_path = tmp_path / "config.yaml"
+        site, db_path = self._setup_site(tmp_path, fixtures_dir, config_path)
+        self._run_cli(config_path, "index")
+        (site / "content" / "post" / "test-post" / "index.md").unlink()
+        (site / "content" / "post" / "test-post").rmdir()
+        self._run_cli(config_path, "index")
+        from hugo_memex.db import Database
+        db = Database(str(db_path))
+        rows = db.execute_sql(
+            "SELECT archived_at FROM pages WHERE path = ?",
+            ("post/test-post/index.md",),
+        )
+        assert rows and rows[0]["archived_at"] is not None
+        db.close()
+        result = self._run_cli(config_path, "purge", "--missing")
+        assert result.returncode == 0
+        db = Database(str(db_path))
+        rows = db.execute_sql(
+            "SELECT 1 FROM pages WHERE path = ?",
+            ("post/test-post/index.md",),
+        )
+        assert rows == []
+        db.close()
+
+    def test_purge_archived_before_filters_by_date(self, tmp_path, fixtures_dir):
+        config_path = tmp_path / "config.yaml"
+        site, db_path = self._setup_site(tmp_path, fixtures_dir, config_path)
+        self._run_cli(config_path, "index")
+        from hugo_memex.db import Database
+        db = Database(str(db_path))
+        db.conn.execute(
+            "INSERT INTO pages (path, title, section, kind, front_matter, content_hash, indexed_at, archived_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("post/old/index.md", "Old", "post", "page", "{}", "h",
+             "2025-01-01T00:00:00Z", "2025-06-01T00:00:00Z"),
+        )
+        db.conn.commit()
+        db.close()
+        result = self._run_cli(
+            config_path, "purge", "--archived-before", "2026-01-01",
+        )
+        assert result.returncode == 0
+        db = Database(str(db_path))
+        rows = db.execute_sql(
+            "SELECT 1 FROM pages WHERE path = 'post/old/index.md'"
+        )
+        assert rows == []
+        db.close()
+
+    def test_purge_dry_run_does_not_purge(self, tmp_path, fixtures_dir):
+        config_path = tmp_path / "config.yaml"
+        site, db_path = self._setup_site(tmp_path, fixtures_dir, config_path)
+        self._run_cli(config_path, "index")
+        (site / "content" / "post" / "test-post" / "index.md").unlink()
+        (site / "content" / "post" / "test-post").rmdir()
+        self._run_cli(config_path, "index")
+        result = self._run_cli(
+            config_path, "purge", "--missing", "--dry-run",
+        )
+        assert result.returncode == 0
+        from hugo_memex.db import Database
+        db = Database(str(db_path))
+        rows = db.execute_sql(
+            "SELECT archived_at FROM pages WHERE path = ?",
+            ("post/test-post/index.md",),
+        )
+        assert rows and rows[0]["archived_at"] is not None
+        db.close()
+
+    def test_purge_archived_missing_marginalia(self, tmp_path, fixtures_dir):
+        config_path = tmp_path / "config.yaml"
+        site, db_path = self._setup_site(tmp_path, fixtures_dir, config_path)
+        self._run_cli(config_path, "index")
+        yaml_file = site / "data" / "marginalia" / "post" / "test-post.yaml"
+        yaml_file.unlink()
+        self._run_cli(config_path, "index")
+        result = self._run_cli(config_path, "purge", "--missing")
+        assert result.returncode == 0
+        from hugo_memex.db import Database
+        db = Database(str(db_path))
+        rows = db.execute_sql(
+            "SELECT 1 FROM marginalia WHERE source_file = ?",
+            ("data/marginalia/post/test-post.yaml",),
+        )
+        assert rows == []
+        db.close()
