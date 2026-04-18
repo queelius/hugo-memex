@@ -11,7 +11,6 @@ from hugo_memex.writer import (
     _marginalia_id,
     add_marginalia,
     create_page,
-    delete_marginalia_from_disk,
     get_front_matter_template,
     marginalia_path_for_page,
     page_path_for_marginalia,
@@ -518,42 +517,105 @@ class TestAddMarginalia:
         assert id3 != id1
 
 
-class TestDeleteMarginaliaFromDisk:
-    """Tests for delete_marginalia_from_disk."""
-
-    def test_delete_note(self, writable_site):
+class TestArchiveMarginaliaOnDisk:
+    def test_archive_adds_archived_at_field(self, writable_site):
         site, _ = writable_site
-        r1 = add_marginalia(str(site), "post/test-post/index.md", "Note one")
-        r2 = add_marginalia(str(site), "post/test-post/index.md", "Note two")
+        from hugo_memex.writer import add_marginalia, archive_marginalia_on_disk
+        r = add_marginalia(str(site), "post/test-post/index.md", "to archive")
+        result = archive_marginalia_on_disk(
+            str(site), r["source_file"], r["id"], "2026-04-18T12:00:00Z",
+        )
+        assert result["status"] == "archived"
+        assert result["archived_at"] == "2026-04-18T12:00:00Z"
 
-        result = delete_marginalia_from_disk(str(site), r1["source_file"], r1["id"])
-        assert result["status"] == "deleted"
-        assert result["id"] == r1["id"]
-
-        # Verify only one note remains
         import yaml as _yaml
-        full_path = Path(str(site)) / r1["source_file"]
-        notes = _yaml.safe_load(full_path.read_text(encoding="utf-8"))
-        assert len(notes) == 1
-        assert notes[0]["id"] == r2["id"]
+        notes = _yaml.safe_load(
+            (Path(site) / r["source_file"]).read_text()
+        )
+        target = next(n for n in notes if n["id"] == r["id"])
+        assert target["archived_at"] == "2026-04-18T12:00:00Z"
 
-    def test_delete_last_note_removes_file(self, writable_site):
+    def test_archive_already_archived_is_noop(self, writable_site):
         site, _ = writable_site
-        r1 = add_marginalia(str(site), "post/test-post/index.md", "Only note")
+        from hugo_memex.writer import add_marginalia, archive_marginalia_on_disk
+        r = add_marginalia(str(site), "post/test-post/index.md", "double-archive")
+        archive_marginalia_on_disk(
+            str(site), r["source_file"], r["id"], "2026-04-18T12:00:00Z",
+        )
+        result = archive_marginalia_on_disk(
+            str(site), r["source_file"], r["id"], "2026-05-01T00:00:00Z",
+        )
+        assert result["status"] == "already_archived"
+        import yaml as _yaml
+        notes = _yaml.safe_load(
+            (Path(site) / r["source_file"]).read_text()
+        )
+        target = next(n for n in notes if n["id"] == r["id"])
+        assert target["archived_at"] == "2026-04-18T12:00:00Z"
 
-        full_path = Path(str(site)) / r1["source_file"]
-        assert full_path.exists()
-
-        delete_marginalia_from_disk(str(site), r1["source_file"], r1["id"])
-        assert not full_path.exists()
-
-    def test_delete_not_found(self, writable_site):
+    def test_archive_not_found_raises(self, writable_site):
         site, _ = writable_site
-        add_marginalia(str(site), "post/test-post/index.md", "A note")
-
+        from hugo_memex.writer import add_marginalia, archive_marginalia_on_disk
+        r = add_marginalia(str(site), "post/test-post/index.md", "x")
         with pytest.raises(ValueError, match="not found"):
-            delete_marginalia_from_disk(
-                str(site),
-                "data/marginalia/post/test-post.yaml",
-                "mg-nonexistent00",
+            archive_marginalia_on_disk(
+                str(site), r["source_file"], "mg-missing", "2026-04-18T12:00:00Z",
             )
+
+
+class TestRestoreMarginaliaOnDisk:
+    def test_restore_removes_archived_at(self, writable_site):
+        site, _ = writable_site
+        from hugo_memex.writer import (
+            add_marginalia, archive_marginalia_on_disk, restore_marginalia_on_disk,
+        )
+        r = add_marginalia(str(site), "post/test-post/index.md", "to restore")
+        archive_marginalia_on_disk(
+            str(site), r["source_file"], r["id"], "2026-04-18T12:00:00Z",
+        )
+        result = restore_marginalia_on_disk(str(site), r["source_file"], r["id"])
+        assert result["status"] == "restored"
+        import yaml as _yaml
+        notes = _yaml.safe_load(
+            (Path(site) / r["source_file"]).read_text()
+        )
+        target = next(n for n in notes if n["id"] == r["id"])
+        assert "archived_at" not in target
+
+    def test_restore_already_active_is_noop(self, writable_site):
+        site, _ = writable_site
+        from hugo_memex.writer import add_marginalia, restore_marginalia_on_disk
+        r = add_marginalia(str(site), "post/test-post/index.md", "already-active")
+        result = restore_marginalia_on_disk(str(site), r["source_file"], r["id"])
+        assert result["status"] == "already_active"
+
+
+class TestPurgeMarginaliaFromDisk:
+    def test_purge_removes_note_from_yaml(self, writable_site):
+        site, _ = writable_site
+        from hugo_memex.writer import add_marginalia, purge_marginalia_from_disk
+        r1 = add_marginalia(str(site), "post/test-post/index.md", "keep")
+        r2 = add_marginalia(str(site), "post/test-post/index.md", "purge")
+        result = purge_marginalia_from_disk(str(site), r2["source_file"], r2["id"])
+        assert result["status"] == "purged"
+        import yaml as _yaml
+        notes = _yaml.safe_load(
+            (Path(site) / r1["source_file"]).read_text()
+        )
+        ids = [n["id"] for n in notes]
+        assert r1["id"] in ids
+        assert r2["id"] not in ids
+
+    def test_purge_last_note_removes_file(self, writable_site):
+        site, _ = writable_site
+        from hugo_memex.writer import add_marginalia, purge_marginalia_from_disk
+        r = add_marginalia(str(site), "post/test-post/index.md", "only")
+        purge_marginalia_from_disk(str(site), r["source_file"], r["id"])
+        assert not (Path(site) / r["source_file"]).exists()
+
+    def test_purge_not_found_raises(self, writable_site):
+        site, _ = writable_site
+        from hugo_memex.writer import add_marginalia, purge_marginalia_from_disk
+        r = add_marginalia(str(site), "post/test-post/index.md", "x")
+        with pytest.raises(ValueError, match="not found"):
+            purge_marginalia_from_disk(str(site), r["source_file"], "mg-missing")

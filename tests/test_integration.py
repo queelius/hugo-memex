@@ -8,7 +8,7 @@ import pytest
 from hugo_memex.db import Database
 from hugo_memex.indexer import index_content
 from hugo_memex.mcp import create_server
-from hugo_memex.writer import add_marginalia, delete_marginalia_from_disk
+from hugo_memex.writer import add_marginalia, purge_marginalia_from_disk
 
 
 @pytest.fixture
@@ -272,11 +272,11 @@ class TestMarginaliaLifecycle:
         bodies = [n["body"] for n in notes_after_add]
         assert "New lifecycle note" in bodies
 
-        # 8. Delete the new note from disk
-        delete_result = delete_marginalia_from_disk(
+        # 8. Purge the new note from disk (hard delete)
+        delete_result = purge_marginalia_from_disk(
             str(site), result["source_file"], result["id"],
         )
-        assert delete_result["status"] == "deleted"
+        assert delete_result["status"] == "purged"
 
         # 9. Re-index: count should return to original
         stats3 = index_content(str(site), db)

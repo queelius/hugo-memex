@@ -169,43 +169,102 @@ def add_marginalia(hugo_root: str, page_path: str, body: str) -> dict:
     }
 
 
-def delete_marginalia_from_disk(
+def _read_marginalia_notes(yaml_path: Path) -> list[dict]:
+    """Read and parse a marginalia YAML file. Returns empty list if missing or malformed."""
+    if not yaml_path.exists():
+        return []
+    raw = yaml_path.read_text(encoding="utf-8")
+    data = yaml.safe_load(raw)
+    return data if isinstance(data, list) else []
+
+
+def _write_marginalia_notes(yaml_path: Path, notes: list[dict]) -> None:
+    """Write a list of notes to a YAML file. Deletes the file if list is empty."""
+    if not notes:
+        if yaml_path.exists():
+            yaml_path.unlink()
+        return
+    yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    yaml_path.write_text(
+        yaml.dump(notes, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def archive_marginalia_on_disk(
+    hugo_root: str, source_file: str, note_id: str, timestamp: str,
+) -> dict:
+    """Mark a marginalia note archived by adding archived_at to its YAML entry.
+
+    Idempotent: if the note already has archived_at, the existing value is
+    preserved and status is "already_archived".
+
+    Raises ValueError if the file or note is not found.
+    """
+    yaml_path = Path(hugo_root) / source_file
+    if not yaml_path.exists():
+        raise ValueError(f"Marginalia file not found: {source_file}")
+    notes = _read_marginalia_notes(yaml_path)
+    target = None
+    for n in notes:
+        if n.get("id") == note_id:
+            target = n
+            break
+    if target is None:
+        raise ValueError(f"Note {note_id} not found in {source_file}")
+    if target.get("archived_at"):
+        return {
+            "id": note_id, "status": "already_archived",
+            "archived_at": target["archived_at"],
+        }
+    target["archived_at"] = timestamp
+    _write_marginalia_notes(yaml_path, notes)
+    return {"id": note_id, "status": "archived", "archived_at": timestamp}
+
+
+def restore_marginalia_on_disk(
     hugo_root: str, source_file: str, note_id: str,
 ) -> dict:
-    """Delete a single marginalia note from a YAML file.
+    """Remove the archived_at field from a marginalia note's YAML entry.
 
-    If the file becomes empty after deletion, the file itself is removed.
-
-    Returns:
-        Dict with ``id``, ``status``.
-
-    Raises:
-        ValueError: If the note ID is not found in the file.
+    No-op (returns already_active) if the note is not currently archived.
+    Raises ValueError if the file or note is not found.
     """
-    root = Path(hugo_root)
-    yaml_path = root / source_file
-
+    yaml_path = Path(hugo_root) / source_file
     if not yaml_path.exists():
-        raise ValueError(f"Marginalia note {note_id!r} not found")
+        raise ValueError(f"Marginalia file not found: {source_file}")
+    notes = _read_marginalia_notes(yaml_path)
+    target = None
+    for n in notes:
+        if n.get("id") == note_id:
+            target = n
+            break
+    if target is None:
+        raise ValueError(f"Note {note_id} not found in {source_file}")
+    if not target.get("archived_at"):
+        return {"id": note_id, "status": "already_active"}
+    del target["archived_at"]
+    _write_marginalia_notes(yaml_path, notes)
+    return {"id": note_id, "status": "restored"}
 
-    raw = yaml_path.read_text(encoding="utf-8")
-    notes = yaml.safe_load(raw)
-    if not isinstance(notes, list):
-        raise ValueError(f"Marginalia note {note_id!r} not found")
 
+def purge_marginalia_from_disk(
+    hugo_root: str, source_file: str, note_id: str,
+) -> dict:
+    """Remove a marginalia note from its YAML file entirely (hard delete on disk).
+
+    If the file becomes empty after removal, the file itself is deleted.
+    Raises ValueError if the file or note is not found.
+    """
+    yaml_path = Path(hugo_root) / source_file
+    if not yaml_path.exists():
+        raise ValueError(f"Marginalia file not found: {source_file}")
+    notes = _read_marginalia_notes(yaml_path)
     remaining = [n for n in notes if n.get("id") != note_id]
     if len(remaining) == len(notes):
-        raise ValueError(f"Marginalia note {note_id!r} not found")
-
-    if remaining:
-        yaml_path.write_text(
-            yaml.dump(remaining, default_flow_style=False, allow_unicode=True),
-            encoding="utf-8",
-        )
-    else:
-        yaml_path.unlink()
-
-    return {"id": note_id, "status": "deleted"}
+        raise ValueError(f"Note {note_id} not found in {source_file}")
+    _write_marginalia_notes(yaml_path, remaining)
+    return {"id": note_id, "status": "purged"}
 
 
 def _resolve_within(root: Path, *parts: str) -> Path:
