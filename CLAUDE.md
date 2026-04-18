@@ -38,13 +38,13 @@ pip install -e ".[dev]"
 ### Data flow
 
 ```
-Hugo content/ files
+Hugo content/ files + data/marginalia/*.yaml
     | indexer.py (parse > classify > extract > save)
-SQLite DB (pages + pages_fts + taxonomies + sync_state)
-    | mcp.py (8 tools + 3 resources, read-only authorizer)
+SQLite DB (pages + pages_fts + taxonomies + marginalia + marginalia_fts + sync_state)
+    | mcp.py (12 tools + 3 resources, read-only authorizer)
 LLM via MCP
-    | writer tools (create_page, update_page)
-Hugo content/ files  <-- loop back to top via rebuild_index
+    | writer tools (create_page, update_page, add_marginalia, delete_marginalia)
+Hugo content/ + data/marginalia/  <-- loop back to top via rebuild_index
 ```
 
 ### Module responsibilities
@@ -52,8 +52,8 @@ Hugo content/ files  <-- loop back to top via rebuild_index
 - **parser.py**: Detects front matter format (YAML `---`, TOML `+++`, JSON `{`) and splits into `(dict, body)`. Stateless, no DB access.
 - **config.py**: Loads `~/.config/hugo-memex/config.yaml` with env var overrides (`HUGO_MEMEX_HUGO_ROOT`, `HUGO_MEMEX_DATABASE_PATH`). Also parses `hugo.toml` for taxonomy discovery.
 - **db.py**: Raw `sqlite3`, no ORM. WAL mode, foreign keys, FTS5 with porter stemming. Schema is in `SCHEMA_SQL` constant; migrations via `_MIGRATIONS` dict. The `readonly` flag installs a SQLite authorizer callback that denies all writes at the C level.
-- **indexer.py**: Walks `content/`, hashes files (SHA-256), skips unchanged via `sync_state` table, writes page+taxonomies+sync atomically. Removes orphaned pages on full reindex.
-- **writer.py**: Creates/updates Hugo content files on disk. Path traversal protection via `is_relative_to()` + slug/section validation regex. `update_page` only supports YAML front matter (TOML/JSON would require `tomli_w` and risk mangling).
+- **indexer.py**: Walks `content/` and `data/marginalia/`, hashes files (SHA-256), skips unchanged via `sync_state` table, writes page+taxonomies+sync atomically. Runs content pass first, then marginalia pass. Removes orphaned pages and marginalia on full reindex.
+- **writer.py**: Creates/updates Hugo content files and marginalia YAML files on disk. Path traversal protection via `is_relative_to()` + slug/section validation regex. `update_page` only supports YAML front matter (TOML/JSON would require `tomli_w` and risk mangling). Marginalia IDs are deterministic: `mg-` + SHA-256(page_path+body+created)[:12].
 - **mcp.py**: FastMCP v2 server. `create_server(db, config)` accepts test injection (skips lifespan). `rebuild_index` temporarily lifts the authorizer or opens a separate write connection. Resources are closures over `mcp` (no ctx parameter).
 
 ### Schema (4 tables + 2 virtual)
@@ -68,7 +68,7 @@ Hugo content/ files  <-- loop back to top via rebuild_index
 ### Security model
 
 - MCP `execute_sql` uses a SQLite authorizer callback (`_readonly_authorizer`) that allowlists `SQLITE_SELECT`, `SQLITE_READ`, `SQLITE_FUNCTION` and denies everything else. This cannot be bypassed via SQL (unlike PRAGMA query_only). `PRAGMA query_only` and `PRAGMA writable_schema` are explicitly denied.
-- All filesystem write paths (create_page, update_page, get_content) use `Path.resolve()` + `is_relative_to()` to prevent path traversal. Symlinks are resolved and checked. Slug/section inputs are validated against `[A-Za-z0-9._-]+` regex.
+- All filesystem write paths (create_page, update_page, get_content, add_marginalia, delete_marginalia) use `Path.resolve()` + `is_relative_to()` to prevent path traversal. Symlinks are resolved and checked. Slug/section inputs are validated against `[A-Za-z0-9._-]+` regex.
 
 ## Conventions
 
