@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest *)",
+      "Bash(ruff *)",
+      "Bash(pip index *)",
+      "mcp__plugin_playwright_playwright__browser_wait_for",
+      "mcp__plugin_playwright_playwright__browser_snapshot",
+      "mcp__photo-memex__get_thumbnail",
+      "mcp__photo-memex__run_sql",
+      "mcp__photo-memex__get_stats",
+      "mcp__photo-memex__list_tags",
+      "mcp__memex__get_conversations"
+    ]
+  }
+}
