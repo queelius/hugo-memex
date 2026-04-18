@@ -31,10 +31,19 @@ def _word_count(text: str) -> int:
 
 
 def _normalize_date(value: Any) -> str | None:
-    """Normalize various date formats to ISO 8601 string."""
+    """Normalize various date formats to ISO 8601 string.
+
+    For UTC datetimes, emits the Z-form (``...Z``) rather than ``+00:00``
+    to match the conventional RFC 3339 representation used in YAML/JSON.
+    """
     if value is None:
         return None
-    if isinstance(value, (datetime, date)):
+    if isinstance(value, datetime):
+        s = value.isoformat()
+        if s.endswith("+00:00"):
+            s = s[:-6] + "Z"
+        return s
+    if isinstance(value, date):
         return value.isoformat()
     s = str(value)
     return s if s else None
@@ -157,8 +166,9 @@ def index_content(
         force: If True, re-index all files regardless of sync state.
 
     Returns:
-        Stats dict with keys: indexed, unchanged, removed, errors,
-        marginalia_indexed, marginalia_unchanged, marginalia_removed.
+        Stats dict with keys: indexed, unchanged, archived, restored, errors,
+        marginalia_indexed, marginalia_unchanged, marginalia_archived,
+        marginalia_restored.
     """
     hugo_root_path = Path(hugo_root)
     content_dir = hugo_root_path / "content"
@@ -173,14 +183,24 @@ def index_content(
     else:
         md_files = discover_content(content_dir)
 
-    stats = {
-        "indexed": 0, "unchanged": 0, "removed": 0, "errors": [],
+    stats: dict[str, Any] = {
+        "indexed": 0, "unchanged": 0, "archived": 0, "restored": 0,
+        "errors": [],
         "marginalia_indexed": 0, "marginalia_unchanged": 0,
-        "marginalia_removed": 0,
+        "marginalia_archived": 0, "marginalia_restored": 0,
     }
 
     # Track which paths we've seen for cleanup
     seen_paths: set[str] = set()
+
+    # Snapshot archived_at state for all known pages before the indexing pass,
+    # since INSERT OR REPLACE in index_page clears the column to its default.
+    pre_archived_paths: set[str] = set()
+    if not paths:
+        pre_archived_rows = db.execute_sql(
+            "SELECT path FROM pages WHERE archived_at IS NOT NULL"
+        )
+        pre_archived_paths = {r["path"] for r in pre_archived_rows}
 
     for md_file in md_files:
         rel_path = str(md_file.relative_to(content_dir))
@@ -223,14 +243,24 @@ def index_content(
         except Exception as e:
             stats["errors"].append({"path": rel_path, "error": str(e)})
 
-    # Cleanup: remove pages that no longer exist on disk
+    # Archive pages whose source file is missing; restore pages whose file returned.
     if not paths:
-        indexed_paths = db.get_all_indexed_paths()
-        removed_paths = indexed_paths - seen_paths
-        for path in removed_paths:
-            db.delete_page(path)
-            db.delete_sync_state(path)
-            stats["removed"] += 1
+        all_known_paths = db.get_all_indexed_paths()
+        missing_paths = all_known_paths - seen_paths
+        now_iso = _now_iso()
+        for path in missing_paths:
+            if path not in pre_archived_paths:
+                db.archive_page(path, now_iso)
+                stats["archived"] += 1
+            # Missing but already archived: no-op (idempotent)
+        # A page is "restored" if it was archived before this run and its file
+        # is now present again. index_page's INSERT OR REPLACE clears archived_at
+        # for rows that were re-indexed; we only need to explicitly restore
+        # when the "unchanged" fast-path skipped re-indexing.
+        restored_paths = pre_archived_paths & seen_paths
+        for path in restored_paths:
+            db.restore_page(path)  # no-op if already cleared by INSERT OR REPLACE
+            stats["restored"] += 1
 
     # ── Marginalia pass ─────────────────────────────────────────
     data_dir = hugo_root_path / "data"
@@ -246,7 +276,6 @@ def index_content(
             file_hash = _content_hash(raw_bytes)
             file_mtime = yaml_file.stat().st_mtime
 
-            # Incremental check
             if not force:
                 sync = db.get_sync_state(rel_file)
                 if sync and sync["content_hash"] == file_hash:
@@ -257,50 +286,79 @@ def index_content(
                     stats["marginalia_unchanged"] += 1
                     continue
 
-            # Parse YAML
             notes = yaml.safe_load(raw_bytes.decode("utf-8"))
             if not isinstance(notes, list):
                 notes = []
 
-            # Compute page_path from the marginalia file's relative path
             marginalia_rel = str(
                 yaml_file.relative_to(data_dir / "marginalia")
             )
             page_path = page_path_for_marginalia(marginalia_rel)
 
-            # Clear old entries for this source file before re-inserting
-            db.delete_marginalia_by_source(rel_file)
-
+            # Diff sync: compare YAML notes to existing DB rows for this source.
+            existing_rows = db.execute_sql(
+                "SELECT id, archived_at FROM marginalia WHERE source_file = ?",
+                (rel_file,),
+            )
+            existing_by_id = {r["id"]: r for r in existing_rows}
+            yaml_by_id: dict[str, dict] = {}
             notes_in_file = 0
+            now_iso = _now_iso()
             for note in notes:
                 note_id = note.get("id")
                 body = note.get("body")
                 if not note_id or not body:
                     continue
-                created_at = note.get("created", _now_iso())
+                yaml_by_id[note_id] = note
+                created_at = _normalize_date(note.get("created")) or now_iso
+                archived_at = _normalize_date(note.get("archived_at"))
                 db.save_marginalia({
                     "id": note_id,
                     "page_path": page_path,
                     "body": body,
                     "created_at": created_at,
                     "source_file": rel_file,
+                    "archived_at": archived_at,
                 })
                 notes_in_file += 1
 
-            # Update sync state
+                prev = existing_by_id.get(note_id)
+                if prev is not None:
+                    was_archived = prev["archived_at"] is not None
+                    now_archived = archived_at is not None
+                    if not was_archived and now_archived:
+                        stats["marginalia_archived"] += 1
+                    elif was_archived and not now_archived:
+                        stats["marginalia_restored"] += 1
+
+            # Notes in DB but not in YAML anymore: archive them.
+            for existing_id, prev in existing_by_id.items():
+                if existing_id in yaml_by_id:
+                    continue
+                if prev["archived_at"] is None:
+                    db.archive_marginalia(existing_id, now_iso)
+                    stats["marginalia_archived"] += 1
+
             db.save_sync_state(rel_file, file_hash, file_mtime, _now_iso())
             stats["marginalia_indexed"] += notes_in_file
 
         except Exception as e:
             stats["errors"].append({"path": rel_file, "error": str(e)})
 
-    # Cleanup: remove marginalia whose source_file no longer exists
+    # Archive marginalia from YAML files that no longer exist on disk.
     if not paths:
         known_sources = db.get_all_marginalia_source_files()
-        removed_sources = known_sources - seen_marginalia_sources
-        for source in removed_sources:
-            db.delete_marginalia_by_source(source)
-            db.delete_sync_state(source)
-            stats["marginalia_removed"] += 1
+        missing_sources = known_sources - seen_marginalia_sources
+        now_iso = _now_iso()
+        for source in missing_sources:
+            existing = db.execute_sql(
+                "SELECT id, archived_at FROM marginalia WHERE source_file = ?",
+                (source,),
+            )
+            for row in existing:
+                if row["archived_at"] is None:
+                    db.archive_marginalia(row["id"], now_iso)
+                    stats["marginalia_archived"] += 1
+            # Leave sync_state intact so we can detect the file returning.
 
     return stats

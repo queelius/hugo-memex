@@ -159,7 +159,7 @@ class TestIndexContent:
         assert "media/test-book.md" in draft_paths
 
     def test_cleanup_removed_files(self, tmp_path):
-        """Test that pages are removed when files are deleted from disk."""
+        """Test that pages are archived when files are deleted from disk."""
         # Create a minimal Hugo site
         (tmp_path / "hugo.toml").write_text(
             'title = "test"\n[taxonomies]\ntag = "tags"\n'
@@ -180,8 +180,13 @@ class TestIndexContent:
         post_dir.rmdir()
 
         stats2 = index_content(str(tmp_path), db)
-        assert stats2["removed"] == 1
-        assert db.execute_sql("SELECT COUNT(*) as n FROM pages")[0]["n"] == 0
+        assert stats2["archived"] == 1
+        # Row still exists but archived_at is set (soft delete)
+        rows = db.execute_sql(
+            "SELECT archived_at FROM pages WHERE path = 'post/temp/index.md'"
+        )
+        assert len(rows) == 1
+        assert rows[0]["archived_at"] is not None
         db.close()
 
     def test_index_real_site(self):
@@ -265,3 +270,179 @@ class TestMarginaliaIndexing:
         # Marginalia should still be there (orphan survival)
         notes_after = db.get_marginalia("post/test-post/index.md")
         assert len(notes_after) == len(notes_before)
+
+
+class TestIndexerSoftDelete:
+    def test_archived_yaml_note_is_archived_in_db(self, hugo_root, db):
+        """A note with archived_at in YAML lands archived in the DB."""
+        stats = index_content(str(hugo_root), db)
+        assert stats["errors"] == []
+        rows = db.execute_sql(
+            "SELECT id, archived_at FROM marginalia WHERE id = ?",
+            ("mg-fixture00003",),
+        )
+        assert rows[0]["archived_at"] == "2026-04-18T00:00:00Z"
+
+    def test_missing_page_archives_instead_of_deleting(self, tmp_path, fixtures_dir):
+        """When a .md file is removed, the page row is archived, not deleted."""
+        import shutil
+        site = tmp_path / "site"
+        shutil.copytree(fixtures_dir, site)
+        db = Database(":memory:")
+        index_content(str(site), db)
+        target = site / "content" / "post" / "test-post" / "index.md"
+        target.unlink()
+        target.parent.rmdir()
+        stats = index_content(str(site), db)
+        assert stats["archived"] == 1
+        rows = db.execute_sql(
+            "SELECT path, archived_at FROM pages WHERE path = ?",
+            ("post/test-post/index.md",),
+        )
+        assert len(rows) == 1
+        assert rows[0]["archived_at"] is not None
+        db.close()
+
+    def test_returning_page_is_restored(self, tmp_path, fixtures_dir):
+        """When a previously-missing .md file returns, archived_at is cleared."""
+        import shutil
+        site = tmp_path / "site"
+        shutil.copytree(fixtures_dir, site)
+        db = Database(":memory:")
+        index_content(str(site), db)
+        target = site / "content" / "post" / "test-post" / "index.md"
+        saved_content = target.read_text()
+        target.unlink()
+        target.parent.rmdir()
+        index_content(str(site), db)
+        target.parent.mkdir(parents=True)
+        target.write_text(saved_content)
+        stats = index_content(str(site), db)
+        assert stats["restored"] == 1
+        rows = db.execute_sql(
+            "SELECT archived_at FROM pages WHERE path = ?",
+            ("post/test-post/index.md",),
+        )
+        assert rows[0]["archived_at"] is None
+        db.close()
+
+    def test_returning_page_with_changed_content_is_restored(
+        self, tmp_path, fixtures_dir,
+    ):
+        """When an archived .md file returns with different content, archived_at clears."""
+        import shutil
+        site = tmp_path / "site"
+        shutil.copytree(fixtures_dir, site)
+        db = Database(":memory:")
+        index_content(str(site), db)
+        target = site / "content" / "post" / "test-post" / "index.md"
+        target.unlink()
+        target.parent.rmdir()
+        index_content(str(site), db)
+        # Now return with DIFFERENT content so it re-indexes.
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            '---\ntitle: "Test Post"\ndraft: false\n---\n'
+            'Fresh body content for the restored post.\n'
+        )
+        stats = index_content(str(site), db)
+        assert stats["indexed"] == 1
+        assert stats["restored"] == 1
+        rows = db.execute_sql(
+            "SELECT archived_at FROM pages WHERE path = ?",
+            ("post/test-post/index.md",),
+        )
+        assert rows[0]["archived_at"] is None
+        db.close()
+
+    def test_archive_is_idempotent(self, tmp_path, fixtures_dir):
+        """Re-indexing an already-archived page does not re-archive."""
+        import shutil
+        site = tmp_path / "site"
+        shutil.copytree(fixtures_dir, site)
+        db = Database(":memory:")
+        index_content(str(site), db)
+        target = site / "content" / "post" / "test-post" / "index.md"
+        target.unlink()
+        target.parent.rmdir()
+        s1 = index_content(str(site), db)
+        s2 = index_content(str(site), db)
+        assert s1["archived"] == 1
+        assert s2["archived"] == 0
+        db.close()
+
+    def test_missing_marginalia_file_archives_all_its_notes(self, tmp_path, fixtures_dir):
+        """When a marginalia YAML is removed, all its DB rows get archived_at set."""
+        import shutil
+        site = tmp_path / "site"
+        shutil.copytree(fixtures_dir, site)
+        db = Database(":memory:")
+        index_content(str(site), db)
+        yaml_file = site / "data" / "marginalia" / "post" / "test-post.yaml"
+        yaml_file.unlink()
+        stats = index_content(str(site), db)
+        assert stats["marginalia_archived"] >= 2
+        rows = db.execute_sql(
+            "SELECT id, archived_at FROM marginalia "
+            "WHERE id IN ('mg-fixture00001', 'mg-fixture00002')"
+        )
+        for r in rows:
+            assert r["archived_at"] is not None
+        db.close()
+
+    def test_returning_marginalia_file_restores_notes(self, tmp_path, fixtures_dir):
+        """When a removed marginalia YAML returns, its notes un-archive."""
+        import shutil
+        site = tmp_path / "site"
+        shutil.copytree(fixtures_dir, site)
+        db = Database(":memory:")
+        index_content(str(site), db)
+        yaml_file = site / "data" / "marginalia" / "post" / "test-post.yaml"
+        saved = yaml_file.read_text()
+        yaml_file.unlink()
+        index_content(str(site), db)
+        yaml_file.write_text(saved)
+        stats = index_content(str(site), db, force=True)
+        assert stats["marginalia_restored"] >= 2
+        rows = db.execute_sql(
+            "SELECT id, archived_at FROM marginalia "
+            "WHERE id = 'mg-fixture00001'"
+        )
+        assert rows[0]["archived_at"] is None
+        db.close()
+
+    def test_manual_yaml_archived_at_edit_syncs_to_db(self, tmp_path, fixtures_dir):
+        """Editing a YAML to add archived_at to a note marks the DB row archived."""
+        import shutil
+        import yaml as _yaml
+        site = tmp_path / "site"
+        shutil.copytree(fixtures_dir, site)
+        db = Database(":memory:")
+        index_content(str(site), db)
+        rows = db.execute_sql(
+            "SELECT archived_at FROM marginalia WHERE id = 'mg-fixture00001'"
+        )
+        assert rows[0]["archived_at"] is None
+        yaml_file = site / "data" / "marginalia" / "post" / "test-post.yaml"
+        notes = _yaml.safe_load(yaml_file.read_text())
+        for n in notes:
+            if n["id"] == "mg-fixture00001":
+                n["archived_at"] = "2026-04-18T15:00:00Z"
+        yaml_file.write_text(_yaml.dump(notes, sort_keys=False))
+        stats = index_content(str(site), db)
+        assert stats["marginalia_archived"] == 1
+        rows = db.execute_sql(
+            "SELECT archived_at FROM marginalia WHERE id = 'mg-fixture00001'"
+        )
+        assert rows[0]["archived_at"] == "2026-04-18T15:00:00Z"
+        db.close()
+
+    def test_stats_keys_renamed(self, hugo_root, db):
+        """The stats dict uses archived/restored keys, not removed."""
+        stats = index_content(str(hugo_root), db)
+        assert "archived" in stats
+        assert "restored" in stats
+        assert "marginalia_archived" in stats
+        assert "marginalia_restored" in stats
+        assert "removed" not in stats
+        assert "marginalia_removed" not in stats

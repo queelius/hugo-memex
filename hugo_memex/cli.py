@@ -74,7 +74,8 @@ def cmd_index(args):
     print(
         f"Indexed: {stats['indexed']}, "
         f"Unchanged: {stats['unchanged']}, "
-        f"Removed: {stats['removed']}"
+        f"Archived: {stats['archived']}, "
+        f"Restored: {stats['restored']}"
     )
     if stats["errors"]:
         print(f"Errors: {len(stats['errors'])}", file=sys.stderr)
